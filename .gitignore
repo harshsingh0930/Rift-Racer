@@ -1,0 +1,22 @@
+# Dependencies and package-manager output
+node_modules/
+npm-debug.log*
+# Vite and build output
+.vite/
+coverage/
+*.tsbuildinfo
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+
+# Temporary local files
+*.local
+*.tmp
+*.swp
