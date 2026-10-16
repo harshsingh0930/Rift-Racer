@@ -698,6 +698,7 @@ export class RaceHud {
     const storage = resolveStorage(this.storage);
     try {
       storage?.removeItem(this.bestTimesStorageKey);
+      storage?.removeItem(this.bestTimeStorageKey);
     } catch {
       // A privacy-mode storage failure should not break the race HUD.
     }

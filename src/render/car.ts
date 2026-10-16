@@ -47,6 +47,8 @@ export interface RiftCarVisualState {
   drift?: number;
   speed?: number;
   velocity?: Readonly<{ x: number; y: number; z: number }>;
+  /** Grade of the road in the car's direction of travel, in radians. */
+  roadPitch?: number;
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {
@@ -141,9 +143,9 @@ function makeTaillightMesh(material: MeshBasicMaterial, x: number): Mesh<BoxGeom
 function makeHeadlightBeam(material: MeshBasicMaterial, x: number): Mesh<ConeGeometry, MeshBasicMaterial> {
   // ConeGeometry points along +Y. Rotating it puts the tip down the road (+Z)
   // while the open sides keep the volume cheap and readable from the chase cam.
-  const beam = new Mesh(new ConeGeometry(0.16, 3.8, 8, 1, true), material);
-  beam.position.set(x, 0.5, 3.3);
-  beam.rotation.x = Math.PI * 0.5;
+  const beam = new Mesh(new ConeGeometry(0.65, 4.8, 8, 1, true), material);
+  beam.position.set(x, 0.45, 3.9);
+  beam.rotation.x = -Math.PI * 0.5;
   beam.name = x < 0 ? "rift-car-headlight-beam-left" : "rift-car-headlight-beam-right";
   beam.renderOrder = 3;
   return beam;
@@ -467,11 +469,13 @@ export class RiftCar extends Group {
     // the road supplied by the existing host lift.
     const visualGroup = new Group();
     visualGroup.name = "rift-car-grounded-visuals";
-    visualGroup.position.y = -0.24;
+    visualGroup.position.y = (this.wheelRadius - 0.38) * 1.12;
     visualGroup.scale.setScalar(1.12);
     const existingChildren = [...this.children];
     visualGroup.add(...existingChildren);
     this.add(visualGroup);
+    // Ground effects follow the road transform without the visual suspension.
+    this.add(contactShadow, underglow);
     this.visualGroup = visualGroup;
     this.setHeadlights(options.headlights !== false);
 
@@ -481,7 +485,7 @@ export class RiftCar extends Group {
       finiteOr(options.position?.z, 0),
     );
     this.heading = finiteOr(options.heading, 0);
-    this.rotation.y = this.heading;
+    this.rotation.set(0, this.heading, 0, "YXZ");
   }
 
   /** Update visual transform and subtle motion from an arcade CarState. */
@@ -489,7 +493,8 @@ export class RiftCar extends Group {
     if (this.disposed) return;
     this.position.set(state.position.x, state.position.y, state.position.z);
     this.heading = finiteOr(state.heading, this.heading);
-    this.rotation.y = this.heading;
+    const roadPitch = "roadPitch" in state ? finiteOr(state.roadPitch, 0) : 0;
+    this.rotation.set(-roadPitch, this.heading, 0, "YXZ");
 
     const steering = clamp(finiteOr(state.steering, 0), -1, 1);
     const drift = clamp(finiteOr(state.drift, 0), 0, 1);
@@ -502,8 +507,8 @@ export class RiftCar extends Group {
       ),
     );
     // Readable, restrained lean: the player can still see the road under the car.
-    this.rotation.z = clamp(-steering * 0.055 - steering * drift * 0.08, -0.16, 0.16);
-    this.rotation.x = clamp(-speed * 0.0014, -0.09, 0.02);
+    this.visualGroup.rotation.z = clamp(-steering * 0.035 - steering * drift * 0.045, -0.08, 0.08);
+    this.visualGroup.rotation.x = clamp(-speed * 0.0005, -0.025, 0.02);
 
     const wheelSpin = (speed * Math.max(0, deltaSeconds)) / Math.max(this.wheelRadius, EPSILON);
     this.wheelMeshes.forEach((wheel) => {
@@ -522,7 +527,7 @@ export class RiftCar extends Group {
     this.headlightBeams.forEach((beam) => {
       beam.visible = this.headlightsEnabled;
       beam.intensity = this.headlightsEnabled
-        ? 1.05 + speed * 0.018 + driftGlow * 0.18
+        ? 8 + speed * 0.2 + driftGlow * 2
         : 0;
     });
     this.headlightBeamMeshes.forEach((beam) => {

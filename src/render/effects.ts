@@ -13,7 +13,7 @@ import {
   Vector3,
 } from "three";
 import type { CarState } from "../game/arcade";
-import { SAMPLE_ROUTE, type TrackRoute } from "../game/track";
+import { SAMPLE_ROUTE, sampleTrackPosition, sampleTrackTangent, sampleTrackWidth, type TrackRoute } from "../game/track";
 import type { QualityTier } from "../game/performance";
 
 const UP = new Vector3(0, 1, 0);
@@ -195,23 +195,20 @@ export function createChevronMarkers(
   const barGeometry = new BoxGeometry(0.12, height, length);
   let markerCount = 0;
 
-  for (const segment of route.segments) {
-    if (segment.length <= EPSILON || markerCount >= maxMarkers) continue;
-    const tangent = new Vector3().subVectors(
-      segment.end.position,
-      segment.start.position,
-    ).normalize();
+  for (let distance = spacing; distance < route.totalLength && markerCount < maxMarkers; distance += spacing) {
+    const tangent = sampleTrackTangent(route, distance);
+    const ahead = sampleTrackTangent(route, distance + 12);
+    // Use distance spacing, independent of how finely the road is sampled.
+    if (tangent.dot(ahead) > 0.97) continue;
     const side = makeSideVector(tangent);
-    const count = Math.max(1, Math.ceil(segment.length / spacing));
-    for (let step = 0; step < count && markerCount < maxMarkers; step += 1) {
-      const amount = (step + 0.5) / count;
-      const position = segment.start.position.clone().lerp(segment.end.position, amount);
-      const width = segment.start.width + (segment.end.width - segment.start.width) * amount;
+      const position = sampleTrackPosition(route, distance);
+      const width = sampleTrackWidth(route, distance);
+      const turnSide = tangent.clone().cross(ahead).y > 0 ? -1 : 1;
       const marker = new Group();
       marker.name = "rift-chevron-marker";
       marker.position
         .copy(position)
-        .addScaledVector(side, width * edgeOffset)
+        .addScaledVector(side, turnSide * width * edgeOffset)
         .addScaledVector(UP, 0.13);
       marker.quaternion.setFromUnitVectors(FORWARD, tangent);
       marker.userData.riftChevron = true;
@@ -227,7 +224,6 @@ export function createChevronMarkers(
       marker.add(left, right);
       group.add(marker);
       markerCount += 1;
-    }
   }
 
   group.userData.riftChevronMaterial = material;
@@ -252,6 +248,7 @@ export class RiftEffects extends Group {
   private sparkCursor = 0;
   private skidAccumulator = 0;
   private sparkAccumulator = 0;
+  private emissionScale = 1;
   private elapsedSeconds = 0;
   private randomState = 0x7251a9;
   private disposed = false;
@@ -315,14 +312,14 @@ export class RiftEffects extends Group {
     mark.mesh.visible = true;
     mark.mesh.position.copy(position);
     mark.mesh.position.y += 0.025;
-    mark.mesh.rotation.set(-Math.PI * 0.5, heading, 0);
+    mark.mesh.rotation.set(-Math.PI * 0.5, heading, 0, "YXZ");
     mark.mesh.scale.set(0.85 + clamp(intensity, 0, 1) * 0.35, 0.8 + clamp(intensity, 0, 1) * 0.6, 1);
     mark.mesh.material.opacity = 0.42 + clamp(intensity, 0, 1) * 0.27;
   }
 
   /** Emit a short burst of orange/pink particles from a world-space point. */
   emitSparks(origin: Vector3, direction: Vector3 = new Vector3(), amount = 7): void {
-    const count = Math.max(0, Math.min(32, Math.floor(amount)));
+    const count = Math.max(0, Math.min(32, Math.round(amount * this.emissionScale)));
     const baseDirection = direction.lengthSq() > EPSILON
       ? direction.clone().normalize()
       : new Vector3(0, 0.25, 1);
@@ -374,8 +371,8 @@ export class RiftEffects extends Group {
     const steering = Math.abs(clamp(finiteOr(carState.steering, 0), -1, 1));
     if (drift <= 0.12 || speed <= 4 || steering <= 0.04) return;
 
-    this.skidAccumulator += delta * (0.7 + speed * 0.07);
-    this.sparkAccumulator += delta * (0.35 + drift * speed * 0.06);
+    this.skidAccumulator += delta * (0.7 + speed * 0.07) * this.emissionScale;
+    this.sparkAccumulator += delta * (0.35 + drift * speed * 0.06) * this.emissionScale;
     const wheels = options.wheelPositions ? [...options.wheelPositions] : getWheelPositionsFromState(carState);
     const heading = finiteOr(carState.heading, 0);
     if (this.skidAccumulator >= 0.055) {
@@ -399,6 +396,8 @@ export class RiftEffects extends Group {
   }
 
   clearEffects(): void {
+    this.skidAccumulator = 0;
+    this.sparkAccumulator = 0;
     this.skidPool.forEach((mark) => {
       mark.life = 0;
       mark.mesh.visible = false;
@@ -422,6 +421,10 @@ export class RiftEffects extends Group {
     disposeObject(this);
     this.clearEffects();
     super.clear();
+  }
+
+  setEmissionScale(scale: number): void {
+    this.emissionScale = clamp(finiteOr(scale, 1), 0.2, 1.5);
   }
 
   private updateSkidMarks(delta: number): void {

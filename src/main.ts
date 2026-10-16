@@ -1,6 +1,7 @@
 import {
   ACESFilmicToneMapping,
   Color,
+  FogExp2,
   PCFShadowMap,
   PCFSoftShadowMap,
   PerspectiveCamera,
@@ -16,10 +17,13 @@ import {
   updateCarState,
   type CarState,
 } from './game/arcade';
+import { RouteProgress } from './game/progress';
+import { RaceAudio } from './game/audio';
 import {
   findNearestTrackPoint,
   sampleTrackPosition,
   sampleTrackTangent,
+  sampleTrackSection,
   SAMPLE_ROUTE,
 } from './game/track';
 import {
@@ -37,11 +41,13 @@ import { createKeyboardInput, type KeyboardInputController } from './input';
 import { createRiftCar, type RiftCar } from './render/car';
 import { createRiftEffects, type RiftEffects } from './render/effects';
 import { createRiftWorld, type RiftWorld } from './render/world';
+import { ChaseCamera } from './render/camera';
+import { RenderPipeline } from './render/pipeline';
 import { createRaceHud, type RaceHud } from './ui';
 
 const TOTAL_LAPS = 3;
 const WORLD_SPEED_TO_KMH = 7.75;
-const CAR_ROAD_LIFT = 0.24;
+const CAR_ROAD_LIFT = 0.045;
 const COUNTDOWN_STEP_SECONDS = 0.8;
 const COUNTDOWN_STEPS = 3;
 const GO_DISPLAY_SECONDS = 0.55;
@@ -70,6 +76,8 @@ let requestedQuality: QualityProfile = quality;
 let renderer: WebGLRenderer | undefined;
 let scene: Scene | undefined;
 let camera: PerspectiveCamera | undefined;
+let chaseCamera: ChaseCamera | undefined;
+let pipeline: RenderPipeline | undefined;
 let world: RiftWorld | undefined;
 let car: RiftCar | undefined;
 let effects: RiftEffects | undefined;
@@ -91,17 +99,12 @@ let wallSparkCooldown = 0;
 let countdownElapsedSeconds = 0;
 let goDisplayRemaining = 0;
 let nearestTrackDistance = 0;
-let cameraHasTarget = false;
-
-const cameraTarget = new Vector3();
-const cameraTargetDesired = new Vector3();
-const cameraDesired = new Vector3();
-const forward = new Vector3();
-const cameraForward = new Vector3();
-const roadCenterAhead = new Vector3();
 const roadTangent = new Vector3();
-const roadTangentAhead = new Vector3();
 const wheelPositions: Vector3[] = [];
+const routeProgress = new RouteProgress(SAMPLE_ROUTE.totalLength);
+const audio = new RaceAudio();
+const coastFogColor = new Color(0x57354f);
+const underwaterFogColor = new Color(0x063746);
 
 const QA_AUTO_START = (() => {
   if (typeof window === 'undefined') return false;
@@ -169,8 +172,10 @@ function makeRenderer(tier: QualityProfile): WebGLRenderer {
 }
 
 function applyResolution(targetRenderer: WebGLRenderer, tier: QualityProfile, scale: number): void {
-  const dpr = Math.min(window.devicePixelRatio || 1, tier === 'ultra' ? 2.5 : 1.5);
-  targetRenderer.setPixelRatio(Math.max(0.5, dpr * scale));
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  // The tier scale and display scale multiply. Bound the final buffer so Ultra
+  // does not accidentally render 14 million pixels on a 1440p laptop screen.
+  targetRenderer.setPixelRatio(Math.max(0.5, Math.min(tier === 'ultra' ? 2 : 1.5, dpr * scale)));
   targetRenderer.setSize(window.innerWidth, window.innerHeight, false);
 }
 
@@ -187,30 +192,10 @@ function applyQualitySettings(
     : PCFShadowMap;
   applyResolution(targetRenderer, tier, settings.resolutionScale);
 
-  targetScene.traverse((object) => {
-    const renderable = object as typeof object & {
-      castShadow?: boolean;
-      receiveShadow?: boolean;
-      isLight?: boolean;
-      type?: string;
-    };
-
-    if (renderable.castShadow !== undefined) {
-      renderable.castShadow = shadowsEnabled;
-    }
-    if (renderable.receiveShadow !== undefined) {
-      renderable.receiveShadow = shadowsEnabled;
-    }
-    if (renderable.isLight) {
-      // Keep the cheap hemisphere fill in Eco so standard materials remain
-      // readable, while disabling the dynamic point lights and their shadows.
-      const dynamicLight = renderable.type !== 'HemisphereLight';
-      renderable.visible = !dynamicLight || settings.realTimeLighting;
-      if ('castShadow' in renderable) {
-        renderable.castShadow = shadowsEnabled && settings.realTimeLighting;
-      }
-    }
-  });
+  // Scene adapters author shadow casters and light visibility deliberately.
+  // Enabling every point-light shadow here adds six renders per light, and
+  // overriding visibility also turns headlights on against their input state.
+  pipeline?.setQuality(tier);
 }
 
 function setHeadlights(enabled: boolean): void {
@@ -346,13 +331,14 @@ function handleQualitySelection(): void {
 }
 
 function resetCarState(): void {
+  nearestTrackDistance = 0;
   const spawn = sampleTrackPosition(SAMPLE_ROUTE, 0, new Vector3());
   const tangent = sampleTrackTangent(SAMPLE_ROUTE, 0, new Vector3());
   carState = createCarState({
     position: { x: spawn.x, y: spawn.y + CAR_ROAD_LIFT, z: spawn.z },
     heading: Math.atan2(tangent.x, tangent.z),
   });
-  car?.update(carState, 0);
+  updateCarVisual(0);
   effects?.clearEffects();
   raceDistanceMeters = 0;
   elapsedSeconds = 0;
@@ -366,7 +352,9 @@ function resetCarState(): void {
   countdownElapsedSeconds = 0;
   goDisplayRemaining = 0;
   nearestTrackDistance = 0;
-  cameraHasTarget = false;
+  chaseCamera?.reset();
+  routeProgress.reset();
+  input?.clearPressedKeys();
   hud?.hideResults();
   hud?.update({
     currentLap,
@@ -389,6 +377,9 @@ function startRace(): void {
     rebuildQualityScene(requestedQuality);
   }
   resetCarState();
+  void audio.start().then((available) => {
+    if (!available) hud?.setSoundEnabled(false);
+  });
   status = 'countdown';
   countdownElapsedSeconds = 0;
   goDisplayRemaining = 0;
@@ -473,7 +464,7 @@ function keepCarOnRoute(nextState: CarState, deltaSeconds: number): CarState {
     }
   }
 
-  correctedPosition.y += (nearest.position.y + CAR_ROAD_LIFT - correctedPosition.y) * Math.min(1, deltaSeconds * 4);
+  correctedPosition.y = nearest.position.y + CAR_ROAD_LIFT;
   return {
     ...nextState,
     position: correctedPosition,
@@ -484,66 +475,16 @@ function keepCarOnRoute(nextState: CarState, deltaSeconds: number): CarState {
 
 function updateCamera(deltaSeconds: number): void {
   if (!camera || !car) return;
+  chaseCamera?.update(car.position, carState.heading, carState.speed, deltaSeconds);
+  world?.sky.position.copy(camera.position);
+}
 
-  forward.set(Math.sin(carState.heading), 0, Math.cos(carState.heading));
+function updateCarVisual(deltaSeconds: number): void {
   sampleTrackTangent(SAMPLE_ROUTE, nearestTrackDistance, roadTangent);
-
-  const speed = Math.max(0, carState.speed);
-  const lookAheadDistance = 5.5 + Math.min(7.2, speed * 0.2);
-  sampleTrackPosition(
-    SAMPLE_ROUTE,
-    nearestTrackDistance + lookAheadDistance,
-    roadCenterAhead,
-  );
-  sampleTrackTangent(
-    SAMPLE_ROUTE,
-    nearestTrackDistance + lookAheadDistance,
-    roadTangentAhead,
-  );
-
-  // Keep the chase rig aligned to the car. A route tangent blend is useful for
-  // smoothing a drift, but letting it steer the whole camera makes the start
-  // view feel rotated on tight authored corners.
-  cameraForward.copy(forward).lerp(roadTangent, 0.12);
-  if (cameraForward.lengthSq() < 0.001) cameraForward.copy(forward);
-  cameraForward.normalize();
-
-  const tangentAlignment = Math.max(-1, Math.min(1, roadTangent.dot(roadTangentAhead)));
-  const cornerSharpness = Math.max(0, Math.min(1, 1 - tangentAlignment));
-  const cameraHeight = 3.35 + cornerSharpness * 0.65 + Math.min(0.3, speed * 0.008);
-
-  cameraDesired
-    .copy(car.position)
-    .addScaledVector(cameraForward, -8.4);
-  cameraDesired.y += cameraHeight;
-
-  cameraTargetDesired
-    .copy(car.position)
-    .addScaledVector(cameraForward, lookAheadDistance + 1.5)
-    // Recenter the horizon only a little. The car stays in the lower middle of
-    // frame while the next bend remains visible instead of pulling the camera
-    // sideways across the road.
-    .lerp(roadCenterAhead, 0.18);
-  cameraTargetDesired.y += 0.82 + cornerSharpness * 0.18;
-
-  const followAmount = 1 - Math.exp(-Math.max(0, deltaSeconds) * 7.5);
-  if (!cameraHasTarget) {
-    camera.position.copy(cameraDesired);
-    cameraTarget.copy(cameraTargetDesired);
-    cameraHasTarget = true;
-  } else {
-    camera.position.lerp(cameraDesired, followAmount);
-    cameraTarget.lerp(cameraTargetDesired, followAmount);
-  }
-
-  camera.lookAt(cameraTarget);
-  // Keep the horizon level. A chase-camera roll makes the route edge read like
-  // floating triangles when the car is stationary on the opening straight.
-  camera.rotation.z = 0;
-
-  const targetFov = 64 + Math.min(10, speed * 0.2);
-  camera.fov += (targetFov - camera.fov) * Math.min(1, Math.max(0, deltaSeconds) * 5);
-  camera.updateProjectionMatrix();
+  const carForward = new Vector3(Math.sin(carState.heading), 0, Math.cos(carState.heading));
+  const roadPitch = Math.atan2(roadTangent.y, Math.hypot(roadTangent.x, roadTangent.z))
+    * Math.sign(carForward.dot(roadTangent));
+  car?.update({ ...carState, roadPitch }, deltaSeconds);
 }
 
 function updateQuality(frameTimeMs: number): void {
@@ -551,6 +492,7 @@ function updateQuality(frameTimeMs: number): void {
   const recommendation = governor.update(frameTimeMs);
   if (!recommendation.changed) return;
   applyResolution(renderer, quality, recommendation.resolutionScale);
+  effects?.setEmissionScale(recommendation.particleMultiplier / QUALITY_SETTINGS[quality].particleMultiplier);
 }
 
 function updateRace(deltaSeconds: number): void {
@@ -561,6 +503,7 @@ function updateRace(deltaSeconds: number): void {
     setHeadlights(inputState.headlightsEnabled);
   }
 
+  const previousPosition = carState.position.clone();
   const nextState = updateCarState(
     carState,
     input.getArcadeInput(),
@@ -570,14 +513,16 @@ function updateRace(deltaSeconds: number): void {
 
   elapsedSeconds += deltaSeconds;
   totalRaceTimeMs = elapsedSeconds * 1_000;
-  raceDistanceMeters += carState.speed * deltaSeconds;
+  const travelDistance = previousPosition.distanceTo(carState.position);
+  raceDistanceMeters += travelDistance;
   const speedKmh = carState.speed * WORLD_SPEED_TO_KMH;
   maxSpeedKmh = Math.max(maxSpeedKmh, speedKmh);
   goDisplayRemaining = Math.max(0, goDisplayRemaining - deltaSeconds);
   wallSparkCooldown = Math.max(0, wallSparkCooldown - deltaSeconds);
 
-  const lapLength = SAMPLE_ROUTE.totalLength;
-  const completedLaps = Math.floor(raceDistanceMeters / lapLength);
+  const nearest = findNearestTrackPoint(SAMPLE_ROUTE, carState.position);
+  const onTrack = nearest.distanceFromTrack <= nearest.width * 0.5 - 0.5;
+  const completedLaps = routeProgress.update(nearestTrackDistance, travelDistance, onTrack);
   if (completedLaps >= currentLap) {
     const lapTimeMs = totalRaceTimeMs - lapStartedAtMs;
     lapTimes.push(lapTimeMs);
@@ -589,13 +534,13 @@ function updateRace(deltaSeconds: number): void {
     }
   }
 
-  car.update(carState, deltaSeconds);
+  updateCarVisual(deltaSeconds);
   effects.update(deltaSeconds, carState, {
     wheelPositions: car.getWheelWorldPositions(wheelPositions),
   });
   world.update(deltaSeconds, {
     elapsedSeconds,
-    routeDistance: raceDistanceMeters,
+    routeDistance: nearestTrackDistance,
     speed: carState.speed,
   });
 
@@ -634,16 +579,21 @@ function updateCountdown(deltaSeconds: number): void {
 function updateIdle(deltaSeconds: number): void {
   world?.update(deltaSeconds, {
     elapsedSeconds,
-    routeDistance: raceDistanceMeters,
+    routeDistance: nearestTrackDistance,
     speed: 0,
   });
-  car?.update(carState, deltaSeconds);
+  updateCarVisual(deltaSeconds);
 }
 
 function renderFrame(now: number): void {
   const frameTimeMs = Math.min(100, Math.max(0, now - lastFrameAt));
   const deltaSeconds = Math.min(0.05, frameTimeMs / 1_000);
   lastFrameAt = now;
+  if (document.hidden) {
+    audio.update(0, 0, 0, false);
+    requestAnimationFrame(renderFrame);
+    return;
+  }
 
   if (status === 'racing') updateRace(deltaSeconds);
   else if (status === 'countdown') updateCountdown(deltaSeconds);
@@ -651,7 +601,14 @@ function renderFrame(now: number): void {
 
   updateCamera(deltaSeconds);
   updateQuality(frameTimeMs);
-  if (renderer && scene && camera) renderer.render(scene, camera);
+  audio.update(carState.speed, carState.throttle, carState.drift, status === 'racing');
+  if (scene?.fog instanceof FogExp2) {
+    const underwater = sampleTrackSection(SAMPLE_ROUTE, nearestTrackDistance) === 'underwater';
+    const amount = 1 - Math.exp(-deltaSeconds * 3);
+    scene.fog.color.lerp(underwater ? underwaterFogColor : coastFogColor, amount);
+    scene.fog.density += ((underwater ? 0.025 : 0.006) - scene.fog.density) * amount;
+  }
+  pipeline?.render();
   requestAnimationFrame(renderFrame);
 }
 
@@ -669,10 +626,9 @@ function createHud(): RaceHud {
       totalLaps: TOTAL_LAPS,
       headlightsEnabled: false,
     },
-    onSoundToggle: () => {
-      // Sound synthesis will be added after the visual slice. The HUD state is
-      // still real and ready for the audio bus, so the control is not dead UI.
-    },
+    bestTimesStorageKey: 'rift-racer.coast-v2.best-runs',
+    bestTimeStorageKey: 'rift-racer.coast-v2.best-run',
+    onSoundToggle: (enabled) => audio.setEnabled(enabled),
     onHeadlightsToggle: (enabled) => setHeadlights(enabled),
     onRestart: startRace,
     onExit: returnToTitle,
@@ -688,6 +644,12 @@ function finishBoot(): void {
   status = 'ready';
   setLoadingProgress(100, 'Ready');
   window.addEventListener('resize', handleResize, { passive: true });
+  window.addEventListener('blur', () => input?.clearPressedKeys());
+  document.addEventListener('visibilitychange', () => {
+    input?.clearPressedKeys();
+    lastFrameAt = performance.now();
+    if (document.hidden) audio.update(0, 0, 0, false);
+  });
   startButton.addEventListener('click', startRace);
   qualitySelect.addEventListener('change', handleQualitySelection);
   window.addEventListener('keydown', (event) => {
@@ -714,7 +676,7 @@ function boot(): void {
   setLoadingProgress(36, `Selecting ${formatQualityLabel(quality)}`);
 
   if (!capabilities.webgl2) {
-    showError('WebGL 2 is unavailable. Enable hardware acceleration, then reload Rift Racer.');
+    showError('WebGL 2 is unavailable. Check browser graphics settings and GPU drivers, then restart your browser.');
     return;
   }
 
@@ -722,14 +684,17 @@ function boot(): void {
     renderer = makeRenderer(quality);
   } catch (error) {
     showError(error instanceof Error
-      ? `${error.message} Enable hardware acceleration, then reload Rift Racer.`
-      : 'WebGL could not be initialized. Enable hardware acceleration, then reload Rift Racer.');
+      ? `${error.message} Check browser graphics settings and GPU drivers, then restart your browser.`
+      : 'WebGL could not be initialized. Check browser graphics settings and GPU drivers.');
     return;
   }
 
   scene = new Scene();
   scene.background = new Color(0x070312);
-  camera = new PerspectiveCamera(66, window.innerWidth / Math.max(1, window.innerHeight), 0.1, 600);
+  scene.fog = new FogExp2(coastFogColor, 0.006);
+  camera = new PerspectiveCamera(60, window.innerWidth / Math.max(1, window.innerHeight), 0.1, 1200);
+  chaseCamera = new ChaseCamera(camera, SAMPLE_ROUTE);
+  pipeline = new RenderPipeline(renderer, scene, camera);
   camera.up.set(0, 1, 0);
   camera.position.set(-7, 3.1, -3);
 

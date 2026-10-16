@@ -54,11 +54,11 @@ export interface KeyboardEventLike {
 
 export interface KeyboardTargetLike {
   addEventListener: (
-    type: 'keydown' | 'keyup',
+    type: 'keydown' | 'keyup' | 'blur',
     listener: (event: KeyboardEventLike) => void,
   ) => void;
   removeEventListener: (
-    type: 'keydown' | 'keyup',
+    type: 'keydown' | 'keyup' | 'blur',
     listener: (event: KeyboardEventLike) => void,
   ) => void;
 }
@@ -245,6 +245,7 @@ export class KeyboardInputController {
   private readonly onKeyUp = (event: KeyboardEventLike): void => {
     this.handleKeyUp(event);
   };
+  private readonly onBlur = (): void => { this.clearPressedKeys(); };
 
   constructor(options: KeyboardInputOptions = {}) {
     this.target = options.target === undefined ? getDefaultKeyboardTarget() : options.target ?? undefined;
@@ -258,6 +259,7 @@ export class KeyboardInputController {
     if (this.attached || !this.target) return this;
     this.target.addEventListener('keydown', this.onKeyDown);
     this.target.addEventListener('keyup', this.onKeyUp);
+    this.target.addEventListener('blur', this.onBlur);
     this.attached = true;
     return this;
   }
@@ -267,6 +269,7 @@ export class KeyboardInputController {
     if (!this.attached || !this.target) return this;
     this.target.removeEventListener('keydown', this.onKeyDown);
     this.target.removeEventListener('keyup', this.onKeyUp);
+    this.target.removeEventListener('blur', this.onBlur);
     this.attached = false;
     return this;
   }

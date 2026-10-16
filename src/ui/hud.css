@@ -230,9 +230,9 @@
   align-self: end;
   justify-self: end;
   position: relative;
-  width: min(32rem, 44vw);
-  min-width: 19rem;
-  min-height: 14rem;
+  width: clamp(15rem, 23vw, 24rem);
+  min-width: 14rem;
+  min-height: 11rem;
   padding-top: 1.3rem;
   pointer-events: none;
 }

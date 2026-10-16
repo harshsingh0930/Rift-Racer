@@ -1,4 +1,4 @@
-import { Vector3 } from "three";
+import { CatmullRomCurve3, Vector3 } from "three";
 
 export type TrackSection = "coastal-boulevard" | "tunnel" | "underwater";
 
@@ -98,6 +98,50 @@ export function createTrackRoute(
     totalLength: distance,
     closed,
   };
+}
+
+/** Sample the authored curve once; rendering, collision and timing share it. */
+export function createSmoothTrackRoute(
+  controlPoints: readonly TrackPoint[],
+  closed = true,
+  spacing = 2,
+): TrackRoute {
+  if (controlPoints.length < 3) return createTrackRoute(controlPoints, closed);
+  const curve = new CatmullRomCurve3(
+    controlPoints.map((point) => point.position.clone()), closed, "centripetal",
+  );
+  const spanCount = closed ? controlPoints.length : controlPoints.length - 1;
+  const points: TrackPoint[] = [];
+  const stepSize = Number.isFinite(spacing) ? Math.max(0.5, spacing) : 2;
+  for (let span = 0; span < spanCount; span += 1) {
+    const start = controlPoints[span];
+    const end = controlPoints[(span + 1) % controlPoints.length];
+    const steps = Math.max(4, Math.ceil(start.position.distanceTo(end.position) / stepSize));
+    for (let step = 0; step < steps; step += 1) {
+      const amount = step / steps;
+      points.push({
+        position: curve.getPoint((span + amount) / spanCount),
+        width: start.width + (end.width - start.width) * amount,
+        section: start.section,
+        ...(step === 0 ? { name: start.name } : {}),
+      });
+    }
+  }
+  if (!closed) points.push(copyTrackPoint(controlPoints[controlPoints.length - 1]));
+  return createTrackRoute(points, closed);
+}
+
+export function sampleTrackSection(route: TrackRoute, distance: number): TrackSection {
+  return findSegment(route, distance)?.section ?? "coastal-boulevard";
+}
+
+export function sampleTrackWidth(route: TrackRoute, distance: number): number {
+  const segment = findSegment(route, distance);
+  if (!segment) return 0;
+  const amount = segment.length > EPSILON
+    ? clamp((normalizeDistance(route, distance) - segment.startDistance) / segment.length, 0, 1)
+    : 0;
+  return segment.start.width + (segment.end.width - segment.start.width) * amount;
 }
 
 function normalizeDistance(route: TrackRoute, distance: number): number {
@@ -263,22 +307,23 @@ const trackPoint = (
  */
 export const SAMPLE_TRACK_POINTS: readonly TrackPoint[] = [
   trackPoint(0, 0, 0, "coastal-boulevard", "harbor start"),
-  trackPoint(34, 0, 0, "coastal-boulevard", "palm straight"),
-  trackPoint(64, 2, -18, "coastal-boulevard", "cliff bend"),
-  trackPoint(70, 3, -52, "coastal-boulevard", "tunnel mouth"),
-  trackPoint(58, 5, -78, "tunnel", "tunnel entry", 11),
-  trackPoint(24, 4, -92, "tunnel", "tunnel curve", 11),
-  trackPoint(-8, 3, -90, "tunnel", "tunnel exit", 11),
-  trackPoint(-34, 1, -70, "tunnel", "shoreline ramp", 11),
-  trackPoint(-48, -4, -40, "underwater", "descent", 14),
-  trackPoint(-52, -10, -4, "underwater", "sunken straight", 14),
-  trackPoint(-34, -12, 25, "underwater", "reef bend", 14),
-  trackPoint(0, -9, 42, "underwater", "kelp tunnel", 14),
-  trackPoint(34, -4, 34, "underwater", "ascent", 14),
-  trackPoint(48, 0, 16, "coastal-boulevard", "surfacing bend"),
+  trackPoint(42, 0, 0, "coastal-boulevard", "palm straight"),
+  trackPoint(82, 2, -20, "coastal-boulevard", "cliff bend"),
+  trackPoint(96, 4, -58, "coastal-boulevard", "tunnel mouth"),
+  trackPoint(70, 5, -98, "tunnel", "tunnel entry", 11),
+  trackPoint(24, 4, -116, "tunnel", "tunnel curve", 11),
+  trackPoint(-26, 3, -108, "tunnel", "tunnel exit", 11),
+  trackPoint(-64, 1, -84, "coastal-boulevard", "shoreline ramp", 11),
+  trackPoint(-88, -4, -48, "underwater", "descent", 14),
+  trackPoint(-96, -10, -4, "underwater", "sunken straight", 14),
+  trackPoint(-86, -12, 36, "underwater", "reef bend", 14),
+  trackPoint(-54, -9, 58, "underwater", "kelp tunnel", 14),
+  trackPoint(-24, -4, 48, "underwater", "ascent", 14),
+  trackPoint(-32, 0, 18, "coastal-boulevard", "surfacing bend"),
+  trackPoint(-24, 0, 0, "coastal-boulevard", "harbor approach"),
 ];
 
-export const SAMPLE_ROUTE: TrackRoute = createTrackRoute(SAMPLE_TRACK_POINTS, true);
+export const SAMPLE_ROUTE: TrackRoute = createSmoothTrackRoute(SAMPLE_TRACK_POINTS, true);
 
 /** Convenient aliases for renderers that call the route a track. */
 export const SAMPLE_TRACK = SAMPLE_ROUTE;

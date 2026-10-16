@@ -20,6 +20,15 @@ function lights(root: ReturnType<typeof createRiftCar>): Light[] {
 }
 
 describe("RiftCar quality-aware lighting", () => {
+  it("allocates working headlights even when the car starts with them off", () => {
+    const car = createRiftCar({ quality: "ultra", headlights: false });
+    const beams = lights(car).filter((light) => light.name === "rift-car-headlight-beam");
+    expect(beams).toHaveLength(2);
+    expect(beams.every((light) => !light.visible)).toBe(true);
+    car.setHeadlights(true);
+    expect(beams.every((light) => light.visible)).toBe(true);
+    car.dispose();
+  });
   it.each(["eco", "balanced"] as const)(
     "keeps %s on emissive meshes without dynamic lights",
     (quality) => {
