@@ -19,6 +19,7 @@ import {
 } from './game/arcade';
 import { RouteProgress } from './game/progress';
 import { RaceAudio } from './game/audio';
+import { tyreSlip } from './game/tyres';
 import { CliffDive } from './game/cliff-dive';
 import { AutomaticTransmission } from './game/transmission';
 import { constrainCarToRoad } from './game/road-contact';
@@ -117,7 +118,7 @@ const wheelPositions: Vector3[] = [];
 const routeProgress = new RouteProgress(SAMPLE_ROUTE.totalLength);
 const audio = new RaceAudio();
 const coastFogColor = new Color(0x57354f);
-const underwaterFogColor = new Color(0x063746);
+const underwaterFogColor = new Color(0x076b8d);
 
 const QA_AUTO_START = (() => {
   if (typeof window === 'undefined') return false;
@@ -254,7 +255,7 @@ function createGovernorForQuality(tier: QualityProfile): FrameTimeGovernor {
     initialSettings: settings,
     // Ultra is the player's explicit choice of image quality. Keep its full
     // resolution instead of silently reducing it after compilation hitches.
-    minResolutionScale: tier === 'ultra' ? settings.resolutionScale : tier === 'balanced' ? 0.75 : 0.5,
+    minResolutionScale: tier === 'ultra' ? 0.85 : tier === 'balanced' ? 0.75 : 0.5,
     maxResolutionScale: settings.resolutionScale,
     maxParticleMultiplier: Math.max(2, settings.particleMultiplier),
     targetFrameTime: tier === 'eco' ? 1000 / 30 : 1000 / 60,
@@ -348,6 +349,7 @@ function handleQualitySelection(): void {
 function resetCarState(): void {
   world?.resetTransitions();
   cliffDive.reset();
+  pipeline?.resetWater();
   transmission.reset();
   engineRpm = 950;
   nearestTrackDistance = 0;
@@ -463,13 +465,13 @@ function finishRace(): void {
   });
 }
 
-function keepCarOnRoute(nextState: CarState): CarState {
-  const result = constrainCarToRoad(SAMPLE_ROUTE, nextState, CAR_ROAD_LIFT);
+function keepCarOnRoute(nextState: CarState, nearest = findNearestTrackPoint(SAMPLE_ROUTE, nextState.position)): CarState {
+  const result = constrainCarToRoad(SAMPLE_ROUTE, nextState, CAR_ROAD_LIFT, nearest);
   nearestTrackDistance = result.nearest.distanceAlongTrack;
   if (result.contact && wallSparkCooldown <= 0) {
     effects?.emitSparks(result.contact.position, result.contact.direction,
-      12 + Math.min(12, result.contact.impactSpeed * 2));
-    wallSparkCooldown = 0.045;
+      28 + Math.min(44, result.state.speed * 0.4 + result.contact.impactSpeed * 1.5));
+    wallSparkCooldown = 0.024;
   }
   return result.state;
 }
@@ -523,16 +525,16 @@ function updateRace(deltaSeconds: number): void {
     const stepDelta = deltaSeconds / steps;
     if (!cliffDive.active) {
       const next = updateCarState(carState, controls, stepDelta);
-      const distance = findNearestTrackPoint(SAMPLE_ROUTE, next.position).distanceAlongTrack;
-      if (!cliffDive.tryLaunch(next, distance)) {
-        carState = keepCarOnRoute(next);
+      const nearest = findNearestTrackPoint(SAMPLE_ROUTE, next.position);
+      if (!cliffDive.tryLaunch(next, nearest.distanceAlongTrack)) {
+        carState = keepCarOnRoute(next, nearest);
         continue;
       }
       carState = next;
     }
     const flight = cliffDive.step(carState, controls, stepDelta);
     carState = flight.state;nearestTrackDistance = cliffDive.routeDistance;
-    if (flight.splash) { effects.emitSplash(flight.splash);audio.playSplash(); }
+    if (flight.splash) { world.emitSplash(flight.splash); effects.emitSplash(flight.splash);audio.playSplash();pipeline?.waterImpact(); }
     if (flight.landed) chaseCamera?.reset();
   }
 
@@ -635,13 +637,15 @@ function renderFrame(now: number): void {
 
   updateCamera(deltaSeconds);
   updateQuality(frameTimeMs);
-  audio.update(carState.speed, carState.throttle, carState.drift, status === 'racing', engineRpm, !cliffDive.active, cliffDive.active && cliffDive.submerged);
+  audio.update(carState.speed, carState.throttle, tyreSlip(carState), status === 'racing', engineRpm, !cliffDive.active,
+    (cliffDive.active && cliffDive.submerged) || sampleTrackSection(SAMPLE_ROUTE, nearestTrackDistance) === 'underwater', carState.brake);
   if (scene?.fog instanceof FogExp2) {
     const underwater = (cliffDive.active && cliffDive.submerged) || sampleTrackSection(SAMPLE_ROUTE, nearestTrackDistance) === 'underwater';
-    const amount = 1 - Math.exp(-deltaSeconds * 3);
+    const amount = 1 - Math.exp(-deltaSeconds * (underwater ? 8 : 3));
     scene.fog.color.lerp(underwater ? underwaterFogColor : coastFogColor, amount);
     scene.fog.density += ((underwater ? 0.025 : 0.018) - scene.fog.density) * amount;
   }
+  pipeline?.updateWater(deltaSeconds, (cliffDive.active && cliffDive.submerged) || sampleTrackSection(SAMPLE_ROUTE, nearestTrackDistance) === "underwater");
   pipeline?.render();
   requestAnimationFrame(renderFrame);
 }
@@ -748,6 +752,9 @@ async function boot(): Promise<void> {
   car = createCarForQuality(quality);
   scene.add(world, effects, car);
   applyQualitySettings(renderer, quality);
+
+  setLoadingProgress(85, 'Preparing scenery and shaders');
+  await renderer.compileAsync(scene, camera);
 
   input = createKeyboardInput({ preventDefault: true, headlightsEnabled: false });
   governor = createGovernorForQuality(quality);

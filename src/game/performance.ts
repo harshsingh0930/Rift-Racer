@@ -66,7 +66,7 @@ const BALANCED_SETTINGS: QualitySettings = Object.freeze({
 });
 
 const ULTRA_SETTINGS: QualitySettings = Object.freeze({
-  resolutionScale: 1.5,
+  resolutionScale: 1,
   particleMultiplier: 1.75,
   effectScale: 1.35,
   maxParticles: 3_200,

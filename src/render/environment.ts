@@ -149,11 +149,20 @@ export function createCoastalEnvironment(route: TrackRoute): Group {
   const openingCount = openings.length;
   while (openings.length < 64) openings.push(new Vector3());
   const waterMaterial = new ShaderMaterial({
-    name: "rift-ocean-material", side: DoubleSide,
-    uniforms: { time: { value: 0 }, playerPosition: { value: new Vector3(0, 1, 0) },
-      openings: { value: openings }, openingCount: { value: openingCount }, hazeColor: { value: new Color(0x57354f) } },
+    name: "rift-ocean-material", side: DoubleSide, transparent: true, depthWrite: false,
+    uniforms: {
+      time: { value: 0 },
+      playerPosition: { value: new Vector3(0, 1, 0) },
+      impactPosition: { value: new Vector3(0, -1.8, 0) },
+      impactTime: { value: -1 },
+      impactStrength: { value: 0 },
+      openings: { value: openings },
+      openingCount: { value: openingCount },
+      hazeColor: { value: new Color(0x0a4967) },
+    },
     vertexShader: `varying vec3 vWorld; void main(){vec4 world=modelMatrix*vec4(position,1.0);vWorld=world.xyz;gl_Position=projectionMatrix*viewMatrix*world;}`,
-    fragmentShader: `uniform float time; uniform vec3 playerPosition; uniform vec3 hazeColor;
+    fragmentShader: `uniform float time; uniform vec3 playerPosition; uniform vec3 impactPosition;
+      uniform float impactTime; uniform float impactStrength; uniform vec3 hazeColor;
       uniform vec3 openings[64]; uniform int openingCount; varying vec3 vWorld;
       float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
       float noise(vec2 p){
@@ -165,6 +174,7 @@ export function createCoastalEnvironment(route: TrackRoute): Group {
           +noise(p*0.57+vec2(-time*0.06,time*0.1))*0.016;
       }
       void main(){
+        if(playerPosition.y < -1.8 && cameraPosition.y > -1.8 && distance(vWorld.xz,playerPosition.xz)<9.0) discard;
         for(int i=0;i<64;i++){
           if(i>=openingCount) break;
           vec2 openingGap=vWorld.xz-openings[i].xy;
@@ -176,15 +186,43 @@ export function createCoastalEnvironment(route: TrackRoute): Group {
         float detail=1.0-smoothstep(45.0,150.0,distanceToCamera);
         vec3 normal=normalize(vec3((height-heightAt(vWorld.xz+vec2(0.6,0.0)))*detail,0.6,(height-heightAt(vWorld.xz+vec2(0.0,0.6)))*detail));
         float fresnel=pow(1.0-max(0.0,dot(view,normal)),4.0);
-        vec3 water=mix(vec3(0.006,0.019,0.035),vec3(0.15,0.065,0.14),fresnel*0.7);
+        // Keep the water legible at the entry: a deep-blue base, cyan fresnel,
+        // and a small wave lift read as water without hiding the dive geometry.
+        vec3 water=mix(vec3(0.008,0.050,0.120),vec3(0.020,0.280,0.440),0.22+fresnel*0.78);
+        float waveLift=smoothstep(0.018,0.075,height);
+        water+=vec3(0.000,0.115,0.185)*waveLift*(0.55+fresnel*0.45);
         vec3 sunDirection=normalize(vec3(230.0,35.0,9.0));
         float glint=pow(max(0.0,dot(reflect(-sunDirection,normal),view)),190.0);
-        water+=vec3(0.55,0.25,0.19)*glint*0.45;
-        water+=vec3(0.004,0.008,0.009)*(height-0.04);
-        vec3 haze=hazeColor;
-        if(cameraPosition.y < -1.8){water=vec3(0.009,0.10,0.15)+water*0.2;haze=vec3(0.002,0.038,0.06);}
-        water=mix(water,haze,1.0-exp(-0.000324*distanceToCamera*distanceToCamera));
-        gl_FragColor=vec4(water,1.0);
+        water+=vec3(0.18,0.72,0.92)*glint*0.72;
+        water+=vec3(0.000,0.026,0.050)*(height-0.04);
+        // This band peaks just below the surface and fades in the deep route,
+        // keeping the cliff landing clear without making the whole ocean flat.
+        float belowSurface=1.0-smoothstep(-2.0,-1.2,cameraPosition.y);
+        float entryBand=belowSurface*smoothstep(-8.0,-1.8,cameraPosition.y);
+        float submerged=1.0-smoothstep(-1.8,-0.6,cameraPosition.y);
+        float hazeDistance=1.0-exp(-0.00018*distanceToCamera*distanceToCamera);
+        float hazeStrength=mix(0.34,0.14,entryBand)*mix(1.0,0.72,submerged);
+        vec3 haze=mix(hazeColor,vec3(0.012,0.235,0.365),entryBand*0.72);
+        water=mix(water,haze,hazeDistance*hazeStrength);
+        water+=vec3(0.000,0.055,0.090)*entryBand;
+        // A short-lived radial response makes the same impact read through
+        // the ocean surface: a moving crest, inner echo, and caustic glow.
+        float impactAge=max(impactTime,0.0);
+        float impactActive=step(0.0,impactTime)*impactStrength*exp(-impactAge*1.35);
+        float impactDistance=length(vWorld.xz-impactPosition.xz);
+        float impactRadius=impactAge*24.0;
+        float impactWidth=0.52+impactAge*0.3;
+        float crest=exp(-pow((impactDistance-impactRadius)/impactWidth,2.0));
+        float echo=exp(-pow((impactDistance-impactRadius*0.58)/(impactWidth*0.82),2.0));
+        float causticPattern=0.5+0.5*sin(impactDistance*6.4-impactAge*13.0);
+        float radialRipple=impactActive*(crest*0.9+echo*0.34)*(0.68+causticPattern*0.32);
+        float radialCaustic=impactActive*exp(-impactDistance/(3.5+impactAge*8.0))
+          *(0.55+0.45*sin(impactDistance*3.2+impactAge*8.0));
+        water+=vec3(0.000,0.26,0.42)*radialRipple;
+        water+=vec3(0.015,0.22,0.36)*radialCaustic*(0.6+fresnel*0.4);
+        float waterOpacity=mix(0.84,0.54,submerged)-entryBand*0.16
+          +radialRipple*0.12+radialCaustic*0.045;
+        gl_FragColor=vec4(water,clamp(waterOpacity,0.34,0.94));
         #include <tonemapping_fragment>
         #include <colorspace_fragment>
       }`,
@@ -203,14 +241,5 @@ export function createCoastalEnvironment(route: TrackRoute): Group {
   seabed.position.y = -40;
   environment.add(seabed);
 
-  // Distant rock silhouettes give the horizon depth without external assets.
-  const rockGeometry = new SphereGeometry(1, 7, 5);
-  const rockMaterial = new MeshStandardMaterial({ color: 0x34213f, roughness: 1, flatShading: true });
-  for (let index = 0; index < 13; index += 1) {
-    const rock = new Mesh(rockGeometry, rockMaterial);
-    rock.position.set(-350 + index * 60, -1, -430 - Math.sin(index * 1.7) * 18);
-    rock.scale.set(20 + (index % 3) * 8, 15 + (index % 4) * 9, 20);
-    environment.add(rock);
-  }
   return environment;
 }

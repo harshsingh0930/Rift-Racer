@@ -22,5 +22,5 @@ Thumbs.db
 *.tmp
 *.swp
 
-
+tests/
 DESIGN.md

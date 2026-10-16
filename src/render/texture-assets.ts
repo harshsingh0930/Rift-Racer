@@ -3,6 +3,7 @@ import { DataTexture, LinearFilter, LinearMipmapLinearFilter, RepeatWrapping, SR
 export const TEXTURE_PATHS = {
   facade: "/textures/coastal-facade.png",
   fish: "/textures/reef-fish.png",
+  foliage: "/textures/foliage-atlas.png",
 } as const;
 
 const images = new Map<string, HTMLImageElement>();

@@ -1,10 +1,10 @@
 import {
-  BoxGeometry, BufferGeometry, Color, DataTexture, DoubleSide, Float32BufferAttribute,
+  AdditiveBlending, BoxGeometry, BufferGeometry, Color, DataTexture, DoubleSide, Float32BufferAttribute,
   Group, InstancedMesh, LinearFilter, Matrix4, Mesh, MeshBasicMaterial,
   MeshStandardMaterial, Quaternion, RepeatWrapping, SRGBColorSpace, TorusGeometry, Vector3,
 } from "three";
 import { sampleTrackPosition, sampleTrackTangent, sampleTrackWidth, type TrackRoute, type Vector3Like } from "../game/track";
-import { getDiveLayout } from "../game/cliff-dive";
+import { getDiveLayout, SEA_LEVEL } from "../game/cliff-dive";
 import type { QualityTier } from "../game/performance";
 
 const UP = new Vector3(0, 1, 0);
@@ -19,6 +19,7 @@ const GLYPHS: Record<string, readonly string[]> = {
   N: ["#...#", "##..#", "##..#", "#.#.#", "#..##", "#..##", "#...#"],
   R: ["####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#"],
   T: ["#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."],
+  V: ["#...#", "#...#", "#...#", "#...#", ".#.#.", ".#.#.", "..#.."],
 };
 
 function label(text: string, size: number, color: number): InstancedMesh {
@@ -102,7 +103,13 @@ function woodTexture(): DataTexture {
   return texture;
 }
 
-type Debris = { pivot: Group; side: number; row: number; baseX: number; baseY: number };
+type Debris = {
+  pivot: Group;
+  side: number;
+  row: number;
+  baseX: number;
+  baseY: number;
+};
 
 /** An exposed cliff end with a wooden breakaway at the cliff lip. */
 export class CliffDiveTransition {
@@ -114,6 +121,7 @@ export class CliffDiveTransition {
   private previousFocus?: number;
   private elapsed = 0;
   private triggered = false;
+  private debrisLifetime = 3.2;
 
   constructor(private readonly route: TrackRoute, lift: number, quality: QualityTier) {
     this.group.name = "rift-cliff-transition";
@@ -121,6 +129,13 @@ export class CliffDiveTransition {
     if (!this.layout) return;
     const { boardDistance, approachStart, entranceDistance } = this.layout;
     const width = sampleTrackWidth(route, boardDistance);
+    const launchHeight = sampleTrackPosition(route, boardDistance).y + lift;
+    const landingHeight = sampleTrackPosition(route, this.layout.boundary).y + lift;
+    const diveDuration = (1.5 + Math.sqrt(1.5 ** 2 + 2 * 9.81 * Math.max(1, launchHeight - landingHeight))) / 9.81;
+    const seaFallTime = Math.sqrt(Math.max(0, launchHeight - SEA_LEVEL) / 4.9);
+    // Keep the shards on screen until the same descent window as the car. They
+    // disappear only after reaching the water, rather than vanishing in air.
+    this.debrisLifetime = Math.max(3.2, Math.min(4.4, Math.max(diveDuration, seaFallTime) + 0.28));
     const lip = new Group();lip.name = "rift-cliff-lip";placeOnRoute(lip, route, boardDistance, lift);this.group.add(lip);
     const rockMaterial = new MeshStandardMaterial({ color: 0x55315d, roughness: 0.95,
       emissive: 0x221132, emissiveIntensity: 0.2, flatShading: true, side: DoubleSide });
@@ -161,29 +176,53 @@ export class CliffDiveTransition {
       const cliff = new Mesh(geometry, rockMaterial);cliff.name = side < 0 ? "rift-cliff-wall-left" : "rift-cliff-wall-right";
       cliff.receiveShadow = true;this.group.add(cliff);
     }
-    const wood = new MeshStandardMaterial({ name: "rift-cliff-weathered-timber", color: 0x86634e,
-      map: woodTexture(), roughness: 0.95, emissive: 0x221021, emissiveIntensity: 0.2 });
+    const wood = new MeshStandardMaterial({ name: "rift-cliff-neon-timber", color: 0x3d2751,
+      map: woodTexture(), metalness: 0.2, roughness: 0.62, emissive: 0x180c2c, emissiveIntensity: 0.48 });
+    const frameMaterial = new MeshStandardMaterial({ name: "rift-cliff-neon-frame", color: 0x11152e,
+      metalness: 0.82, roughness: 0.3, emissive: 0x17133d, emissiveIntensity: 0.8 });
+    const cyanGlow = new MeshBasicMaterial({ name: "rift-cliff-cyan-edge", color: new Color(0x62f4ff).multiplyScalar(2.3),
+      transparent: true, opacity: 0.92, depthWrite: false, blending: AdditiveBlending });
+    const magentaGlow = new MeshBasicMaterial({ name: "rift-cliff-magenta-edge", color: new Color(0xff4fc4).multiplyScalar(2.15),
+      transparent: true, opacity: 0.9, depthWrite: false, blending: AdditiveBlending });
     const timber = new BoxGeometry(1, 1, 1);
     this.barrier.name = "rift-cliff-end-board";this.barrier.userData.breakable = true;
+    this.barrier.userData.hitPoints = 1;
     this.barrier.userData.dynamicVisibility = true;
     this.debris.name = "rift-cliff-board-debris";this.debris.userData.dynamicVisibility = true;
     lip.add(this.barrier, this.debris);
     for (const side of [-1, 1]) {
       const post = new Mesh(new BoxGeometry(0.24, 3.8, 0.26), wood);
-      post.position.set(side * (width / 2 + 0.7), 1.9, 0.2);lip.add(post);
+      post.position.set(side * (width / 2 + 0.7), 1.9, 0.2);this.barrier.add(post);
+      const postGlow = new Mesh(new BoxGeometry(0.07, 3.2, 0.035), side < 0 ? cyanGlow : magentaGlow);
+      postGlow.position.set(side * (width / 2 + 0.7), 1.92, 0.36);this.barrier.add(postGlow);
     }
-    const header = new Mesh(new BoxGeometry(width + 1.8, 0.42, 0.16), wood);
-    header.position.set(0, 3.3, 0.2);lip.add(header);
-    const warning = label("END", 0.16, 0xffd79d);warning.name = "rift-cliff-end-label";
-    warning.position.set(0, 3.95, 0.07);lip.add(warning);
+    const header = new Mesh(new BoxGeometry(width + 1.8, 0.42, 0.16), frameMaterial);
+    header.position.set(0, 3.3, 0.2);this.barrier.add(header);
+    const headerGlow = new Mesh(new BoxGeometry(width + 1.55, 0.065, 0.04), cyanGlow);
+    headerGlow.position.set(0, 3.57, 0.31);this.barrier.add(headerGlow);
+    const lowerGlow = new Mesh(new BoxGeometry(width + 1.3, 0.045, 0.04), magentaGlow);
+    lowerGlow.position.set(0, 0.27, 0.22);this.barrier.add(lowerGlow);
+    const warning = label("END", 0.16, 0xff8ad7);warning.name = "rift-cliff-end-label";
+    warning.position.set(0, 3.92, 0.33);this.barrier.add(warning);
     warning.rotation.y = Math.PI;
-    for (let row = 0; row < 3; row++) {
-      const plank = new Mesh(timber, wood);plank.position.set(0, 0.48 + row * 0.54, 0);
-      plank.scale.set(width + 1.2, 0.36, 0.14);this.barrier.add(plank);
-      for (const side of [-1, 1]) {
-        const pivot = new Group();const baseX = side * (width + 1.2) / 4;const baseY = plank.position.y;
-        pivot.position.set(baseX, baseY, 0);
-        const fragment = new Mesh(timber, wood);fragment.scale.set((width + 1.2) / 2 - 0.04, 0.36, 0.14);
+    const diveLabel = label("DIVE", 0.1, 0x72f5ff);
+    diveLabel.position.set(0, 2.82, 0.33);this.barrier.add(diveLabel);
+    diveLabel.rotation.y = Math.PI;
+    const signBacking = new Mesh(new BoxGeometry(width + 1.38, 2.12, 0.12), frameMaterial);
+    signBacking.position.set(0, 1.7, 0.12);this.barrier.add(signBacking);
+    const plankSpan = width + 1.2;
+    const plankHeight = 0.32;
+    const chunkCount = 4;
+    for (let row = 0; row < 4; row++) {
+      const plank = new Mesh(timber, wood);plank.position.set(0, 0.42 + row * 0.5, 0.22);
+      plank.scale.set(plankSpan, plankHeight, 0.14);this.barrier.add(plank);
+      const chunkWidth = plankSpan / chunkCount;
+      for (let chunk = 0; chunk < chunkCount; chunk += 1) {
+        const baseX = -plankSpan / 2 + chunkWidth / 2 + chunk * chunkWidth;
+        const side = baseX < 0 ? -1 : 1;
+        const pivot = new Group();const baseY = plank.position.y;
+        pivot.position.set(baseX, baseY, 0.22);
+        const fragment = new Mesh(timber, wood);fragment.scale.set(chunkWidth - 0.055, plankHeight, 0.14);
         pivot.add(fragment);this.debris.add(pivot);this.fragments.push({ pivot, side, row, baseX, baseY });
       }
     }
@@ -203,6 +242,11 @@ export class CliffDiveTransition {
   reset(): void {
     this.previousFocus = undefined;this.triggered = false;this.elapsed = 0;
     this.barrier.visible = true;this.debris.visible = false;
+    this.barrier.userData.hitPoints = 1;
+    this.fragments.forEach(({ pivot, baseX, baseY }) => {
+      pivot.position.set(baseX, baseY, 0.22);
+      pivot.rotation.set(0, 0, 0);
+    });
     this.group.userData.transitionTriggered = false;
   }
 
@@ -216,17 +260,22 @@ export class CliffDiveTransition {
     const point = sampleTrackPosition(this.route, focus);
     const nearRoad = !player || Math.hypot(player.x - point.x, player.y - point.y, player.z - point.z) < sampleTrackWidth(this.route, focus) / 2 + 1;
     if (!this.triggered && nearRoad && speed > 0.4 && advance >= 0 && ((gap <= 2.2 && gap >= -2.2) || crossed)) {
-      this.triggered = true;this.elapsed = 0;this.group.userData.transitionTriggered = true;
+      this.triggered = true;this.elapsed = 0;this.barrier.userData.hitPoints = 0;
+      this.group.userData.transitionTriggered = true;
     }
     this.previousFocus = focus;
     this.barrier.visible = !this.triggered;
-    this.debris.visible = this.triggered && this.elapsed < 1.5;
+    this.debris.visible = this.triggered && this.elapsed < this.debrisLifetime;
     if (!this.triggered) return;
     this.elapsed += delta;
     const time = this.elapsed;
     this.fragments.forEach(({ pivot, side, row, baseX, baseY }) => {
-      pivot.position.set(baseX + side * time * (9 + row * 1.5), baseY + time * (3 + row) - 6 * time * time, time * (8 + row));
-      pivot.rotation.set(time * (2 + row), side * time * 1.8, side * time * (2.5 + row));
+      pivot.position.set(
+        baseX + side * time * (7.5 + row * 1.3),
+        baseY + time * (3.5 + row * 0.65) - 5.2 * time * time,
+        0.22 + time * (5.5 + row * 0.8),
+      );
+      pivot.rotation.set(time * (3.2 + row * 0.6), side * time * 2.2, side * time * (2.8 + row * 0.8));
     });
   }
 }

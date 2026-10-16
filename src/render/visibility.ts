@@ -56,6 +56,10 @@ function partitionSurface(mesh: Mesh, route: TrackRoute): Mesh[] {
 
 /** A single instanced batch spanning the map cannot be distance culled. */
 function partitionInstances(mesh: InstancedMesh): void {
+  // Animation owners retain the original instance indices and buffers.
+  for (let ancestor: Object3D | null = mesh; ancestor; ancestor = ancestor.parent) {
+    if (ancestor.userData.dynamicVisibility) return;
+  }
   if (mesh.count < 2 || mesh.name.startsWith("rift-airborne")) return;
   mesh.computeBoundingSphere();
   if (!mesh.boundingSphere || mesh.boundingSphere.radius < 70) return;

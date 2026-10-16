@@ -8,8 +8,8 @@ export class TyreTrails {
   private readonly alphas: Float32Array;
   private readonly lives: Float32Array;
   private readonly strengths: Float32Array;
-  private readonly previous: Array<Vector3 | undefined> = [undefined, undefined];
-  private readonly previousEdges: Array<[Vector3, Vector3] | undefined> = [undefined, undefined];
+  private readonly previous: Array<Vector3 | undefined> = [undefined, undefined, undefined, undefined];
+  private readonly previousEdges: Array<[Vector3, Vector3] | undefined> = [undefined, undefined, undefined, undefined];
   private cursor = 0;
 
   constructor(private readonly route: TrackRoute, readonly capacity = 768) {
@@ -56,38 +56,46 @@ export class TyreTrails {
   }
 
   draw(wheels: readonly Vector3[], intensity: number): void {
-    for (let wheel = 0; wheel < 2; wheel += 1) {
-      const point = wheels[wheel + 2];
+    for (let wheel = 0; wheel < Math.min(4, wheels.length); wheel += 1) {
+      const point = wheels[wheel];
       if (!point) continue;
       const previous = this.previous[wheel];
       if (!previous) { this.previous[wheel] = point.clone(); continue; }
       const distance = previous.distanceTo(point);
       if (distance < 0.055) continue;
       if (distance > 4) { this.previous[wheel] = point.clone(); this.previousEdges[wheel] = undefined; continue; }
-      this.previousEdges[wheel] = this.add(previous, point, intensity, this.previousEdges[wheel]);
+      const wheelIntensity = wheel < 2 ? intensity * 0.82 : intensity;
+      this.previousEdges[wheel] = this.add(previous, point, wheelIntensity, this.previousEdges[wheel]);
       previous.copy(point);
     }
   }
 
   add(start: Vector3, end: Vector3, intensity = 1, joinedEdges?: [Vector3, Vector3]): [Vector3, Vector3] {
-    const side = end.clone().sub(start).cross(new Vector3(0, 1, 0)).normalize().multiplyScalar(0.15);
+    const side = end.clone().sub(start).cross(new Vector3(0, 1, 0)).normalize().multiplyScalar(0.135);
     const left = end.clone().add(side);
     const right = end.clone().sub(side);
     const startLeft = joinedEdges?.[0] ?? start.clone().add(side);
     const startRight = joinedEdges?.[1] ?? start.clone().sub(side);
     const corners = [startLeft, startRight, left, right];
     const index = this.cursor++ % this.capacity;
+    const projectedStart = findNearestTrackPoint(this.route, start).position.y + 0.043;
+    const projectedEnd = findNearestTrackPoint(this.route, end).position.y + 0.043;
     for (let corner = 0; corner < 4; corner += 1) {
       const point = corners[corner];
-      point.y = findNearestTrackPoint(this.route, point).position.y + 0.043;
+      point.y = corner < 2 ? projectedStart : projectedEnd;
       this.positions.set(point.toArray(), index * 12 + corner * 3);
     }
     this.lives[index] = 24;
-    this.strengths[index] = Math.max(0, Math.min(0.92, intensity * 0.92));
+    this.strengths[index] = Math.max(0, Math.min(0.62, intensity * 0.58));
     this.alphas.fill(this.strengths[index], index * 4, index * 4 + 4);
     this.mesh.geometry.attributes.position.needsUpdate = true;
     this.mesh.geometry.attributes.trailAlpha.needsUpdate = true;
     return [left, right];
+  }
+
+  prime(wheels: readonly Vector3[]): void {
+    wheels.forEach((point, index) => { this.previous[index] = point.clone(); });
+    this.previousEdges.fill(undefined);
   }
 
   stop(): void {

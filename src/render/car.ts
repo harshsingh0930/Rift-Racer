@@ -121,10 +121,10 @@ export class RiftCar extends Group {
 
     const beams: SpotLight[] = [];
     if (this.realtimeLighting) {
-      for (const x of [-0.60, 0.60]) {
+      for (const x of [-0.64, 0.64]) {
         const light = new SpotLight(0xd8efff, 35, 28, Math.PI / 7, 0.65, 2);
         light.name = "rift-car-headlight-beam";
-        light.position.set(x, 0.68, 2.1);
+        light.position.set(x, 0.52, 2.20);
         light.target.position.set(x, 0.05, 13);
         this.visualGroup.add(light, light.target);
         beams.push(light);

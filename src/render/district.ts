@@ -1,6 +1,7 @@
 import { BoxGeometry, BufferGeometry, Color, DoubleSide, Float32BufferAttribute, Group, InstancedMesh, Matrix4, Mesh, MeshBasicMaterial, MeshStandardMaterial, Quaternion, Raycaster, Vector3, type Material } from "three";
 import { sampleTrackPosition, sampleTrackSection, sampleTrackTangent, sampleTrackWidth, type TrackRoute } from "../game/track";
 import type { QualityTier } from "../game/performance";
+import { fadeArchitecture } from "./architecture";
 import { detailTexture, sceneryTexture } from "./texture-assets";
 
 const UP = new Vector3(0, 1, 0);
@@ -32,7 +33,10 @@ export function createRoadsideDistrict(route: TrackRoute, quality: QualityTier, 
     color: 0x77718b, roughness: 0.95, side: DoubleSide });
   const cliffMaterial = new MeshStandardMaterial({ name: "rift-violet-cliff-material", map: detailTexture("reef"),
     color: 0x61355f, emissive: 0x180b27, emissiveIntensity: 0.3, roughness: 0.95, flatShading: true, side: DoubleSide });
-  const trimMaterial = new MeshBasicMaterial({ color: new Color(0xf35fbc).multiplyScalar(1.4) });
+  const trimMaterial = new MeshBasicMaterial({ color: new Color(0xff8b55).multiplyScalar(1.4) });
+  const roofMaterial = new MeshStandardMaterial({ color: 0x292034, roughness: 0.9 });
+  fadeArchitecture(roofMaterial);
+  fadeArchitecture(facadeMaterial);fadeArchitecture(trimMaterial);
   const block = new BoxGeometry(1, 1, 1);
   const rotation = new Quaternion();
   const matrix = new Matrix4();
@@ -52,7 +56,7 @@ export function createRoadsideDistrict(route: TrackRoute, quality: QualityTier, 
 
   for (let start = 0; start < route.totalLength; start += chunkSize) {
     const chunk = new Group();
-    chunk.name = "rift-district-chunk";
+    chunk.name = "rift-district-chunk";chunk.userData.routeDistance = start + 24;
     const batches = new Map<string, Batch>();
     const add = (geometry: BufferGeometry, material: Material, transform: Matrix4, name: string) => {
       const key = geometry.uuid + material.uuid;
@@ -177,20 +181,19 @@ export function createRoadsideDistrict(route: TrackRoute, quality: QualityTier, 
           add(block, facadeMaterial, matrix, "rift-grounded-buildings");
           const roof = position.clone().addScaledVector(UP, height + 0.08);
           matrix.compose(roof, rotation, new Vector3(width + 0.15, 0.14, depth + 0.15));
+          add(block, roofMaterial, matrix, "rift-building-roof-cap");
+          const roofEdge = roof.clone().addScaledVector(side, -sign * depth * 0.5);
+          matrix.compose(roofEdge, rotation, new Vector3(width + 0.15, 0.06, 0.055));
           add(block, trimMaterial, matrix, "rift-building-roof-trim");
           // A solid plinth visibly connects the block to the promenade.
           matrix.compose(position.clone().addScaledVector(UP, -0.18), rotation, new Vector3(width + 0.4, 0.36, depth + 0.4));
           add(block, pavementMaterial, matrix, "rift-building-ground-plinths");
         }
       }
-      if (section === "coastal-boulevard" || (skyline && station % 3 === 0 && center.y >= 0.8)) {
-        const position = center.clone().addScaledVector(side, halfWidth + 3.3);
-        position.y -= 0.14;
-        if (safeFootprint(position, 1.8, 6)) prop(palm, position, station * 0.8, 1.1 + station % 3 * 0.08);
-      }
       if (station % 2 === 0) {
-        const position = center.clone().addScaledVector(side, -(halfWidth + 1.25));
-        prop(lamp, position, Math.atan2(side.x, side.z), 1);
+        const lampSide = station % 4 === 0 ? 1 : -1;
+        const position = center.clone().addScaledVector(side, lampSide * (halfWidth + 1.25));
+        prop(lamp, position, Math.atan2(-lampSide * side.x, -lampSide * side.z), 1);
       }
     }
 

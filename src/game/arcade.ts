@@ -92,16 +92,16 @@ export const DEFAULT_ARCADE_TUNING: Readonly<ArcadeTuning> = {
   reverseAcceleration: 10,
   braking: 22,
   rollingDrag: 0.035,
-  lateralGrip: 16,
-  driftGrip: 1.7,
-  corneringGrip: 64,
-  steeringRate: 2.25,
+  lateralGrip: 18,
+  driftGrip: 2.8,
+  corneringGrip: 72,
+  steeringRate: 2.05,
   steeringResponse: 9,
   driftResponse: 10,
   driftLateralResponse: 8,
-  driftLateralSpeed: 0.65,
-  driftSteeringBoost: 0.35,
-  steeringVelocityInfluence: 0.86,
+  driftLateralSpeed: 0.42,
+  driftSteeringBoost: 0.18,
+  steeringVelocityInfluence: 0.90,
   wallBounce: 0.18,
   wallFriction: 0.78,
   wallCorrection: 1,
@@ -269,7 +269,8 @@ export function applySteering(
   next.steering = approach(
     next.steering,
     inputState.steer,
-    Math.max(0, tuning.steeringResponse) * (1 - speedSensitivity * 0.3) * delta,
+    Math.max(0, tuning.steeringResponse) * (1 - speedSensitivity * 0.3)
+      * (Math.abs(inputState.steer) < Math.abs(state.steering) ? 1.45 : 1) * delta,
   );
 
   const forward = forwardForHeading(next.heading);
@@ -288,7 +289,7 @@ export function applySteering(
 
   next.heading = wrapAngle(next.heading + headingDelta);
   if (Math.abs(headingDelta) > EPSILON) {
-    next.velocity.applyAxisAngle(UP, headingDelta * tuning.steeringVelocityInfluence * (1 - next.drift * 0.55));
+    next.velocity.applyAxisAngle(UP, headingDelta * tuning.steeringVelocityInfluence * (1 - next.drift * 0.40));
   }
   if (next.speed > 5 && forwardSpeed > 0) {
     const velocityHeading = Math.atan2(next.velocity.x, next.velocity.z);
@@ -296,7 +297,7 @@ export function applySteering(
     // Rear tyre self-alignment gives a slide a recoverable equilibrium,
     // rather than allowing the body to spin independently of its travel.
     const alignment = Math.max(0, Math.abs(slip) - 0.1)
-      * (2.6 + (1 - Math.abs(inputState.steer)) * 3.4);
+      * (3.4 + (1 - Math.abs(inputState.steer)) * 4.6);
     next.heading = wrapAngle(next.heading + Math.sign(slip) * Math.min(Math.abs(slip), alignment * delta));
   }
   next.speed = next.velocity.length();
@@ -330,7 +331,10 @@ export function applyBrakeAssistedDrift(
   const corneringSlip = clamp((lateralDemand - availableGrip) / (availableGrip * 0.8), 0, 0.85);
   const velocitySlip = Math.abs(Math.atan2(next.velocity.dot(rightForHeading(next.heading)), Math.abs(forwardSpeedBeforeBraking) + 0.1));
   const measuredSlip = Math.abs(forwardSpeedBeforeBraking) > 8 ? clamp((velocitySlip - 0.09) / 0.4, 0, 0.85) : 0;
-  const targetDrift = Math.max(inputState.drift, brakeDrift, corneringSlip, measuredSlip);
+  // A released wheel asks the tyres to regain grip. Feeding residual slip
+  // back at full strength otherwise latches the car into its own slide.
+  const retainedSlip = measuredSlip * clamp(Math.abs(inputState.steer) / 0.35, 0.2, 1);
+  const targetDrift = Math.max(inputState.drift, brakeDrift, corneringSlip, retainedSlip);
 
   next.brake = effectiveBrake;
   next.drift = approach(
