@@ -47,6 +47,7 @@ import { createRiftEffects, type RiftEffects } from './render/effects';
 import { createRiftWorld, type RiftWorld } from './render/world';
 import { ChaseCamera, type CountdownCameraShot } from './render/camera';
 import { RenderPipeline } from './render/pipeline';
+import { prepareRaceTransitions } from './render/prepare-race';
 import { createPaintEnvironment } from './render/lighting';
 import { preloadSceneryTextures } from './render/texture-assets';
 import { createRaceHud, type RaceHud } from './ui';
@@ -314,6 +315,7 @@ function rebuildQualityScene(nextQuality: QualityProfile): boolean {
   requestedQuality = nextQuality;
   governor = createGovernorForQuality(nextQuality);
   applyQualitySettings(renderer, nextQuality);
+  if (camera && pipeline) prepareRaceTransitions(renderer, camera, world, effects, pipeline);
   setHeadlights(headlightsEnabled);
   resetCarState();
   qualityLabel.textContent = formatQualityLabel(nextQuality);
@@ -470,8 +472,8 @@ function keepCarOnRoute(nextState: CarState, nearest = findNearestTrackPoint(SAM
   nearestTrackDistance = result.nearest.distanceAlongTrack;
   if (result.contact && wallSparkCooldown <= 0) {
     effects?.emitSparks(result.contact.position, result.contact.direction,
-      28 + Math.min(44, result.state.speed * 0.4 + result.contact.impactSpeed * 1.5));
-    wallSparkCooldown = 0.024;
+      96 + Math.min(64, result.state.speed * 0.65 + result.contact.impactSpeed * 2));
+    wallSparkCooldown = 0.018;
   }
   return result.state;
 }
@@ -534,7 +536,7 @@ function updateRace(deltaSeconds: number): void {
     }
     const flight = cliffDive.step(carState, controls, stepDelta);
     carState = flight.state;nearestTrackDistance = cliffDive.routeDistance;
-    if (flight.splash) { world.emitSplash(flight.splash); effects.emitSplash(flight.splash);audio.playSplash();pipeline?.waterImpact(); }
+    if (flight.splash) { world.emitSplash(flight.splash); effects.emitSplash(flight.splash);pipeline?.waterImpact(); }
     if (flight.landed) chaseCamera?.reset();
   }
 
@@ -755,6 +757,7 @@ async function boot(): Promise<void> {
 
   setLoadingProgress(85, 'Preparing scenery and shaders');
   await renderer.compileAsync(scene, camera);
+  prepareRaceTransitions(renderer, camera, world, effects, pipeline);
 
   input = createKeyboardInput({ preventDefault: true, headlightsEnabled: false });
   governor = createGovernorForQuality(quality);

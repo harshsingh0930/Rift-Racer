@@ -31,6 +31,7 @@ import {
   TorusGeometry,
   Texture,
   Vector3,
+  Vector4,
 } from "three";
 import {
   SAMPLE_ROUTE,
@@ -1346,6 +1347,7 @@ type CoastalWaterMaterial = ShaderMaterial & {
     impactPosition: { value: Vector3 };
     impactTime: { value: number };
     impactStrength: { value: number };
+    debrisImpacts: { value: Vector4[] };
   };
 };
 
@@ -1505,10 +1507,13 @@ function makeCanopyGeometry(route: TrackRoute, section: TrackSection, fullTube =
 
 function makeTunnelCues(route: TrackRoute, quality: RiftWorldQuality): {
   group: Group;
+  entryLights: Group;
   cues: TunnelCue[];
 } {
   const group = new Group();
   group.name = "rift-tunnel-cues";
+  const entryLights = new Group();
+  entryLights.name = "rift-tunnel-permanent-entry-lights";
   const cues: TunnelCue[] = [];
   const material = new MeshBasicMaterial({
     color: new Color(0xf54fbc).multiplyScalar(3),
@@ -1566,7 +1571,10 @@ function makeTunnelCues(route: TrackRoute, quality: RiftWorldQuality): {
     ring.rotation.set(-Math.atan2(tangent.y, Math.hypot(tangent.x, tangent.z)),
       Math.atan2(tangent.x, tangent.z), 0, "YXZ");
     ring.renderOrder = 3;
-    group.add(ring);
+    const permanent = cues.length < 3;
+    const parent = permanent ? entryLights : group;
+    ring.material.opacity = permanent ? 0.86 : 0;
+    parent.add(ring);
 
     const lightMaterial = ((Math.floor(distance / spacing) % 2 === 0)
       ? cyanLightMaterial
@@ -1576,11 +1584,12 @@ function makeTunnelCues(route: TrackRoute, quality: RiftWorldQuality): {
     light.position.copy(center).addScaledVector(UP, radius - 0.08);
     light.quaternion.copy(ring.quaternion);
     light.renderOrder = 4;
-    group.add(light);
-    cues.push({ ring, distance, spacing, activateAt: Infinity, lightMaterial });
+    lightMaterial.opacity = permanent ? 0.9 : 0;
+    parent.add(light);
+    cues.push({ ring, distance, spacing, activateAt: permanent ? -Infinity : Infinity, lightMaterial });
   }
 
-  return { group, cues };
+  return { group, entryLights, cues };
 }
 
 type UnderwaterCue = {
@@ -1793,6 +1802,7 @@ export class RiftWorld extends Group {
   private readonly airborneCues: AirborneCue[];
   private readonly diveTransition: CliffDiveTransition;
   private readonly oceanMaterial: CoastalWaterMaterial;
+  private debrisImpactCursor = 0;
   readonly localVisibility: LocalSceneVisibility;
   private readonly sectionRanges = new Map<TrackSection, Array<{ start: number; end: number }>>();
   private elapsedSeconds = 0;
@@ -1815,7 +1825,7 @@ export class RiftWorld extends Group {
     this.sky = makeGradientSky();
     this.add(this.sky);
     this.add(createSynthwaveSun());
-    this.environment = createCoastalEnvironment(this.route);
+    this.environment = createCoastalEnvironment(this.route, this.quality);
     this.add(this.environment);
     this.mountainBackdrop = createMountainBackdrop(this.route);this.add(this.mountainBackdrop);
     const ocean = this.environment.getObjectByName("rift-coastal-water-surface") as Mesh<PlaneGeometry, ShaderMaterial>;
@@ -1869,7 +1879,10 @@ export class RiftWorld extends Group {
     this.decorativeCullItems = trackData.decorative;
     this.startGate = createStartGate(this.route, roadLift);
     this.track.add(this.startGate);
-    this.diveTransition = new CliffDiveTransition(this.route, roadLift, this.quality);
+    this.diveTransition = new CliffDiveTransition(this.route, roadLift, this.quality, (position, strength) => {
+      const impacts = this.oceanMaterial.uniforms.debrisImpacts.value;
+      impacts[this.debrisImpactCursor++ % impacts.length].set(position.x, position.z, 0, strength);
+    });
     this.cliffTransition = this.diveTransition.group;
     this.track.add(this.cliffTransition);
     this.add(this.track);
@@ -1889,11 +1902,11 @@ export class RiftWorld extends Group {
     }
 
     const tunnelData = options.environmentCues === false
-      ? { group: new Group(), cues: [] as TunnelCue[] }
+      ? { group: new Group(), entryLights: new Group(), cues: [] as TunnelCue[] }
       : makeTunnelCues(this.route, this.quality);
     this.tunnelCues = tunnelData.group;
     this.tunnelCueData = tunnelData.cues;
-    this.add(this.tunnelCues);
+    this.add(this.tunnelCues, tunnelData.entryLights);
 
     const underwaterData = options.environmentCues === false
       ? { group: new Group(), bubbles: [] as UnderwaterCue[], materials: [] as UnderwaterMaterial[] }
@@ -1927,8 +1940,10 @@ export class RiftWorld extends Group {
   }
 
   private resetTunnelLights(): void {
-    this.tunnelCueData.forEach(cue => {
-      cue.activateAt = Infinity;cue.ring.material.opacity = 0;cue.lightMaterial.opacity = 0;
+    this.tunnelCueData.forEach((cue, index) => {
+      cue.activateAt = index < 3 ? -Infinity : Infinity;
+      cue.ring.material.opacity = index < 3 ? 0.86 : 0;
+      cue.lightMaterial.opacity = index < 3 ? 0.9 : 0;
     });
     this.previousTunnelFocus = 0;
   }
@@ -1944,6 +1959,8 @@ export class RiftWorld extends Group {
   private resetWaterImpact(): void {
     this.oceanMaterial.uniforms.impactTime.value = -1;
     this.oceanMaterial.uniforms.impactStrength.value = 0;
+    this.oceanMaterial.uniforms.debrisImpacts.value.forEach(impact => impact.set(0, 0, -1, 0));
+    this.debrisImpactCursor = 0;
   }
 
   /** Animate emissive accents and environment dressing for one host frame. */
@@ -1957,9 +1974,15 @@ export class RiftWorld extends Group {
     // Real geometry remains visible on approach; the depth buffer handles
     // occlusion. Hiding whole sections caused the tunnel to pop into view.
     this.oceanMaterial.uniforms.time.value = this.elapsedSeconds;
+    this.oceanMaterial.uniforms.debrisImpacts.value.forEach(impact => {
+      if (impact.z >= 0) { impact.z += delta;if (impact.z > 2) impact.z = -1; }
+    });
     if (this.oceanMaterial.uniforms.impactTime.value >= 0) {
       const impactTime = this.oceanMaterial.uniforms.impactTime.value + delta;
-      if (impactTime > 1.8) this.resetWaterImpact();
+      if (impactTime > 1.8) {
+        this.oceanMaterial.uniforms.impactTime.value = -1;
+        this.oceanMaterial.uniforms.impactStrength.value = 0;
+      }
       else this.oceanMaterial.uniforms.impactTime.value = impactTime;
     }
     let focusDistance: number | undefined;
@@ -1999,7 +2022,7 @@ export class RiftWorld extends Group {
       const along = this.route.closed ? Math.min(gap, this.route.totalLength - gap) : gap;
       chunk.visible = along < (chunk.name === "rift-district-chunk" ? 220 : 118);
     }
-    this.diveTransition.update(delta, normalizedFocus, finiteOr(state.speed, 0), state.playerPosition);
+    this.diveTransition.update(delta, normalizedFocus, finiteOr(state.speed, 0), state.playerPosition, this.elapsedSeconds);
     const activeSection = focusDistance === undefined
       ? "coastal-boulevard"
       : sampleTrackSection(this.route, focusDistance);

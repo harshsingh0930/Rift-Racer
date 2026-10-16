@@ -96,7 +96,7 @@ export const DEFAULT_ARCADE_TUNING: Readonly<ArcadeTuning> = {
   driftGrip: 2.8,
   corneringGrip: 72,
   steeringRate: 2.05,
-  steeringResponse: 9,
+  steeringResponse: 3.8,
   driftResponse: 10,
   driftLateralResponse: 8,
   driftLateralSpeed: 0.42,
@@ -266,11 +266,15 @@ export function applySteering(
   const delta = positiveDelta(deltaSeconds);
 
   const speedSensitivity = clamp(state.speed / tuning.maxSpeed, 0, 1);
+  // Short key taps make small corrections. Release/countersteer recentres
+  // promptly; building lock in the new direction takes a deliberate hold.
+  const reversing = next.steering * inputState.steer < 0;
+  const centering = reversing || Math.abs(inputState.steer) < Math.abs(next.steering);
   next.steering = approach(
     next.steering,
-    inputState.steer,
+    reversing ? 0 : inputState.steer,
     Math.max(0, tuning.steeringResponse) * (1 - speedSensitivity * 0.3)
-      * (Math.abs(inputState.steer) < Math.abs(state.steering) ? 1.45 : 1) * delta,
+      * (centering ? 2.4 : 1) * delta,
   );
 
   const forward = forwardForHeading(next.heading);

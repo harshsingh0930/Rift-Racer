@@ -29,6 +29,7 @@ import { TyreTrails } from "./skids";
 import { SpeedEffects } from "./speed-effects";
 import { tyreSlip } from "../game/tyres";
 import { WaterEntryEffect } from "./water-entry";
+import { SparkGlow } from "./spark-glow";
 
 const UP = new Vector3(0, 1, 0);
 const FORWARD = new Vector3(0, 0, 1);
@@ -268,6 +269,7 @@ export class RiftEffects extends Group {
   private readonly sparkPositionAttribute: Float32BufferAttribute;
   private readonly sparkColorAttribute: Float32BufferAttribute;
   private readonly sparkStreakPositionAttribute: BufferAttribute;
+  private readonly sparkGlow: SparkGlow;
   private readonly chevronPulses: ChevronPulse[] = [];
   private sparkCursor = 0;
   private sparkAccumulator = 0;
@@ -282,7 +284,7 @@ export class RiftEffects extends Group {
     this.route = options.route ?? SAMPLE_ROUTE;
     const quality = options.quality ?? "balanced";
     const defaultSkidMarks = quality === "eco" ? 512 : quality === "ultra" ? 4096 : 2048;
-    const defaultSparks = quality === "eco" ? 160 : quality === "ultra" ? 640 : 360;
+    const defaultSparks = quality === "eco" ? 512 : quality === "ultra" ? 2048 : 1280;
     const skidCount = Math.max(4, Math.floor(finiteOr(options.maxSkidMarks, defaultSkidMarks)));
     const sparkCount = Math.max(8, Math.floor(finiteOr(options.maxSparks, defaultSparks)));
 
@@ -307,9 +309,10 @@ export class RiftEffects extends Group {
       active: false,
     }));
     this.sparkStreaks = createSparkStreaks(sparkCount);
+    this.sparkGlow = new SparkGlow(sparkCount);
     this.sparkStreakPositionAttribute = this.sparkStreaks.geometry.getAttribute("position") as BufferAttribute;
     this.sparks.visible = false; // The visible effect is a shower of streaks, with no round sprite heads.
-    this.add(this.sparkStreaks, this.sparks);
+    this.add(this.sparkStreaks, this.sparkGlow, this.sparks);
 
     if (options.chevrons !== false) {
       this.chevrons = createChevronMarkers(this.route, {
@@ -343,28 +346,33 @@ export class RiftEffects extends Group {
     this.tyreTrails.add(position.clone().addScaledVector(forward, -0.5), position.clone().addScaledVector(forward, 0.5), intensity);
   }
 
-  /** Emit a short burst of orange/pink particles from a world-space point. */
+  /** Emit dense metal streaks trailing along the rail from the contact point. */
   emitSparks(origin: Vector3, direction: Vector3 = new Vector3(), amount = 7): void {
-    const count = Math.max(0, Math.min(96, Math.round(amount * this.emissionScale)));
+    const count = Math.max(0, Math.min(192, Math.round(amount * this.emissionScale)));
     const baseDirection = direction.lengthSq() > EPSILON
       ? direction.clone().normalize()
       : new Vector3(0, 0.25, 1);
+    baseDirection.y = 0;
+    if (baseDirection.lengthSq() < EPSILON) baseDirection.set(0, 0, 1);
+    baseDirection.normalize();
+    const fanSide = new Vector3(-baseDirection.z, 0, baseDirection.x);
     for (let index = 0; index < count; index += 1) {
-      const spark = this.sparkPool[this.sparkCursor % this.sparkPool.length];
+      const poolIndex = this.sparkCursor;
+      const spark = this.sparkPool[poolIndex];
       this.sparkCursor = (this.sparkCursor + 1) % this.sparkPool.length;
       const random = () => this.nextRandom();
       spark.active = true;
-      spark.life = 0.16 + random() * 0.22;
+      spark.life = 0.18 + random() * 0.20;
       spark.maxLife = spark.life;
       spark.position.copy(origin);
       spark.position.x += (random() - 0.5) * 0.05;
       spark.position.y += (random() - 0.5) * 0.04;
       spark.position.z += (random() - 0.5) * 0.05;
-      spark.velocity.copy(baseDirection).multiplyScalar(12 + random() * 20);
-      spark.velocity.x += (random() - 0.5) * 8;
-      spark.velocity.y = 0.6 + random() * 4.4;
-      spark.velocity.z += (random() - 0.5) * 8;
-      const poolIndex = this.sparkPool.indexOf(spark);
+      const angle = (random() - 0.5) * 0.28;
+      const launchSpeed = 7 + random() * 18;
+      spark.velocity.copy(baseDirection).multiplyScalar(Math.cos(angle) * launchSpeed)
+        .addScaledVector(fanSide, Math.sin(angle) * launchSpeed);
+      spark.velocity.y = 0.15 + random() ** 1.5 * 2.6;
       const offset = poolIndex * 3;
       this.sparkPositions[offset] = spark.position.x;
       this.sparkPositions[offset + 1] = spark.position.y;
@@ -376,9 +384,9 @@ export class RiftEffects extends Group {
       this.sparkStreakPositionAttribute.setXYZ(poolIndex * 2, spark.position.x, spark.position.y, spark.position.z);
       this.sparkStreakPositionAttribute.setXYZ(
         poolIndex * 2 + 1,
-        spark.position.x - spark.velocity.x * 0.026,
-        spark.position.y - spark.velocity.y * 0.026,
-        spark.position.z - spark.velocity.z * 0.026,
+        spark.position.x - spark.velocity.x * 0.001,
+        spark.position.y - spark.velocity.y * 0.001,
+        spark.position.z - spark.velocity.z * 0.001,
       );
     }
     this.sparkPositionAttribute.needsUpdate = true;
@@ -442,10 +450,11 @@ export class RiftEffects extends Group {
     const colors = this.sparkStreaks.geometry.getAttribute("color");
     this.sparkPool.forEach((spark, index) => {
       const fade = spark.active ? Math.sqrt(Math.max(0, spark.life / spark.maxLife)) : 0;
-      colors.setXYZ(index * 2, 4.5 * fade, 2.5 * fade, 0.9 * fade);
-      colors.setXYZ(index * 2 + 1, 1.4 * fade, 0.25 * fade, 0.015 * fade);
+      colors.setXYZ(index * 2, 3 * fade, 1.5 * fade, 0.4 * fade);
+      colors.setXYZ(index * 2 + 1, 1.2 * fade, 0.22 * fade, 0.015 * fade);
     });
     colors.needsUpdate = true;
+    this.sparkGlow.sync(this.sparkStreakPositionAttribute, colors as BufferAttribute);
   }
 
   dispose(): void {
@@ -477,15 +486,16 @@ export class RiftEffects extends Group {
       }
       spark.velocity.y -= delta * 16;
       spark.position.addScaledVector(spark.velocity, delta);
+      const trailSeconds = Math.min(0.045, spark.maxLife - spark.life);
       this.sparkPositions[offset] = spark.position.x;
       this.sparkPositions[offset + 1] = spark.position.y;
       this.sparkPositions[offset + 2] = spark.position.z;
       this.sparkStreakPositionAttribute.setXYZ(index * 2, spark.position.x, spark.position.y, spark.position.z);
       this.sparkStreakPositionAttribute.setXYZ(
         index * 2 + 1,
-        spark.position.x - spark.velocity.x * 0.026,
-        spark.position.y - spark.velocity.y * 0.026,
-        spark.position.z - spark.velocity.z * 0.026,
+        spark.position.x - spark.velocity.x * trailSeconds,
+        spark.position.y - spark.velocity.y * trailSeconds,
+        spark.position.z - spark.velocity.z * trailSeconds,
       );
     });
     this.sparkPositionAttribute.needsUpdate = true;

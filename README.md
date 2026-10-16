@@ -12,9 +12,9 @@ toolchain:
 
 | Area | Version / choice |
 | --- | --- |
-| Runtime | Node.js 22 LTS or newer (Vite 7 also supports the current Node 20.19+ / 22.12+ lines) |
+| Runtime | Node.js 24.19.0, pinned in `.nvmrc`, `package.json` and `Dockerfile` |
 | Language | TypeScript 5.9 |
-| Dev server and bundler | Vite 7.1 |
+| Dev server and bundler | Vite 7 (exact dependencies in `package-lock.json`) |
 | 3D runtime | Three.js 0.180 with `@types/three` 0.180 |
 | Test runner | Vitest 3.2 |
 | Module format | Native ESM in the browser and Node tooling |
@@ -45,7 +45,9 @@ install` when developing locally.
 From the project root:
 
 ```bash
-npm install
+nvm install
+nvm use
+npm ci
 ```
 
 | Command | Purpose |
@@ -57,11 +59,21 @@ npm install
 | `npm run preview` | Serve the built `dist/` bundle locally (normally port 4173). |
 | `npm run preview -- --host 0.0.0.0 --port 4173` | Preview from a container or another device. |
 
-The test file under `tests/` exercises the pure arcade, route, performance, and
-storage helpers without requiring a DOM or WebGL context. A browser entrypoint
-is not needed to run those tests. `npm run build` does require the Vite entry
-described above; until that entry is supplied, Vite will report its normal
-missing-entry error after the TypeScript check succeeds.
+If you do not use nvm, install Node.js 24.19.0 directly, then run `npm ci`.
+With nvm-windows, use `nvm install 24.19.0` and `nvm use 24.19.0`.
+
+The tests under `tests/` cover driving, camera stability, route transitions,
+audio response, storage and scene construction without needing a browser or
+WebGL context. Once `npm ci` finishes, `npm test` runs without internet access.
+The game also uses bundled textures and synthesized audio rather than remote
+assets. No environment variables or secrets are required; `.env.example`
+records this explicitly.
+
+## Demo
+
+Run `npm run dev` and open <http://localhost:5173>, or build and run
+`npm run preview` to use <http://localhost:4173>. A public deployment URL has
+not been configured in this repository.
 
 ## Controls
 
@@ -71,17 +83,16 @@ gamepad adapter can be kept separate from the game loop:
 | Action | Recommended keyboard mapping | Input contract |
 | --- | --- | --- |
 | Accelerate | `W` or `ArrowUp` | `throttle: 1` |
-| Reverse | `S` or `ArrowDown` | `throttle: -1` |
+| Brake, then reverse once stopped | `S` or `ArrowDown` | `throttle: -1` |
 | Steer left/right | `A` / `D` or `ArrowLeft` / `ArrowRight` | `steer: -1` / `1` |
 | Brake / handbrake | `Space` | `brake: 1` |
-| Explicit drift | `Shift` (optional adapter mapping) | `drift: 1` |
-| Reset run | `R` (UI/scene adapter) | Reset the car and timer |
+| Toggle headlights | `L` | Toggle the headlight state |
+| Return to title | `Escape` | Exit the current run |
 
 Steering and throttle values are clamped to `-1..1`; brake and drift values
 are clamped to `0..1`. Braking while steering automatically produces a
-readable drift, so the explicit drift input is optional. The current game
-modules do not bind DOM keyboard events themselves; the browser shell should
-translate events into this contract.
+readable drift. `src/input/keyboard.ts` binds the keyboard and the browser
+shell passes its snapshots into the simulation.
 
 ## Performance tiers and low-end goals
 
@@ -91,7 +102,7 @@ translate events into this contract.
 | --- | ---: | ---: | --- | --- | --- |
 | **Eco** | `0.75` | `0.5` / `700` | Off | Off | Off |
 | **Balanced** | `1.0` | `1.0` / `1,400` | On | On | Standard |
-| **Ultra** | `1.5` | `1.75` / `3,200` | On | On | High |
+| **Ultra** | `1.0` | `1.75` / `3,200` | On | On | High |
 
 Initial selection is conservative: no WebGL 2, at most two hardware threads, or
 at most 2 GB of reported device memory selects Eco. Ultra requires WebGL 2 plus
@@ -128,7 +139,7 @@ settings and reload the game; without it the 3D route cannot run as intended.
 ## Docker
 
 The included multi-stage Dockerfile uses the existing npm scripts. It installs
-dependencies, runs `npm run build`, and serves the resulting bundle with Vite
+dependencies, runs `npm test` and `npm run build` without network access, and serves the resulting bundle with Vite
 Preview on port 4173:
 
 ```bash
@@ -146,3 +157,15 @@ npm run preview -- --host 0.0.0.0 --port 4173
 The build stage uses `npm ci` from the checked-in lockfile. As with local
 `npm run build`, the browser entrypoint is compiled before the container serves
 the page.
+
+To run the tests explicitly inside a container:
+
+```bash
+docker build --target build -t rift-racer-check .
+docker run --rm --network none rift-racer-check npm test
+```
+
+The first Docker build needs internet access to pull its base image and install
+dependencies. Test execution itself needs no internet. `.dockerignore` excludes
+local dependencies, build output, credentials and editor artifacts while keeping
+the source, tests and bundled game textures in the build context.

@@ -24,11 +24,21 @@ export function constrainCarToRoad(route: TrackRoute, state: CarState, roadLift 
     velocity.addScaledVector(outward, -impactSpeed);
   }
   position.y = nearest.position.y + roadLift;
+  const railTangent = nearest.tangent.clone().setY(0).normalize();
+  const carRight = new Vector3(Math.cos(state.heading), 0, -Math.sin(state.heading));
+  const facingRail = forward.dot(outward);
+  // The leading outer corner touches first when angled into a barrier. When
+  // parallel, use the side panel rather than inventing a point behind the car.
+  const hullContact = position.clone()
+    .addScaledVector(forward, Math.abs(facingRail) > 0.025 ? Math.sign(facingRail) * 2.05 : 0)
+    .addScaledVector(carRight, Math.sign(carRight.dot(outward)) * 1.08);
+  const contactAlongRail = hullContact.sub(nearest.position).dot(railTangent);
+  const travelSign = Math.sign(state.velocity.dot(railTangent)) || 1;
   const contact = penetration > -0.08 && state.speed > 6 ? {
-    position: nearest.position.clone().addScaledVector(outward, nearest.width * 0.5 - 0.10).addScaledVector(UP, 0.63),
-    direction: velocity.clone().normalize().multiplyScalar(-1).addScaledVector(outward, -0.15).setY(0.08),
+    position: nearest.position.clone().addScaledVector(outward, nearest.width * 0.5 - 0.10)
+      .addScaledVector(nearest.tangent, contactAlongRail).addScaledVector(UP, 0.63),
+    direction: railTangent.multiplyScalar(-travelSign).addScaledVector(outward, -0.035).normalize(),
     impactSpeed,
   } : undefined;
-  if (contact) contact.position.addScaledVector(nearest.tangent, -Math.sign(state.velocity.dot(nearest.tangent)) * 2.0);
   return { state: { ...state, position, velocity, speed: velocity.length() }, nearest, contact };
 }

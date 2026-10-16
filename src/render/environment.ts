@@ -1,8 +1,9 @@
 import {
   AdditiveBlending, BoxGeometry, BufferGeometry, Color, DoubleSide,
   Float32BufferAttribute, Group, InstancedMesh, Matrix4, Mesh, MeshStandardMaterial,
-  PlaneGeometry, ShaderMaterial, SphereGeometry, Vector3,
+  PlaneGeometry, ShaderMaterial, SphereGeometry, Vector3, Vector4,
 } from "three";
+import type { QualityTier } from "../game/performance";
 import { sampleTrackPosition, sampleTrackSection, sampleTrackTangent, sampleTrackWidth, type TrackRoute } from "../game/track";
 
 const UP = new Vector3(0, 1, 0);
@@ -130,7 +131,36 @@ export function createSynthwaveSun(): Group {
   return group;
 }
 
-export function createCoastalEnvironment(route: TrackRoute): Group {
+/** Concentrate water vertices near the driver, leaving the horizon inexpensive. */
+function oceanGeometry(quality: QualityTier): BufferGeometry {
+  const rings = quality === "eco" ? 48 : quality === "ultra" ? 80 : 64;
+  const sectors = quality === "eco" ? 96 : 128;
+  const positions: number[] = [];const indices: number[] = [];
+  for (let ring = 0; ring <= rings; ring++) {
+    const radius = (ring / rings) ** 1.8 * 1250;
+    for (let sector = 0; sector <= sectors; sector++) {
+      const angle = sector / sectors * Math.PI * 2;
+      positions.push(Math.cos(angle) * radius, 0, Math.sin(angle) * radius);
+      if (ring < rings && sector < sectors) {
+        const a = ring * (sectors + 1) + sector;const b = a + sectors + 1;
+        indices.push(a, a + 1, b, a + 1, b + 1, b);
+      }
+    }
+  }
+  const geometry = new BufferGeometry();geometry.setAttribute("position", new Float32BufferAttribute(positions, 3));geometry.setIndex(indices);
+  return geometry;
+}
+
+// Gravity-based phase speed keeps the larger swells slower than small waves.
+const SWELL_GLSL = `
+  float swell(vec2 p){
+    return sin(dot(p,vec2(0.94,0.34))*0.19635-time*1.388)*0.22
+      +sin(dot(p,vec2(-0.42,0.91))*0.3696-time*1.905)*0.11
+      +sin(dot(p,vec2(0.65,-0.76))*0.7392-time*2.693)*0.045;
+  }
+`;
+
+export function createCoastalEnvironment(route: TrackRoute, quality: QualityTier = "balanced"): Group {
   const environment = new Group();
   environment.name = "rift-coastal-environment";
   environment.add(makeCoastBanks(route), makeBridgePiers(route));
@@ -156,21 +186,28 @@ export function createCoastalEnvironment(route: TrackRoute): Group {
       impactPosition: { value: new Vector3(0, -1.8, 0) },
       impactTime: { value: -1 },
       impactStrength: { value: 0 },
+      debrisImpacts: { value: Array.from({ length: 8 }, () => new Vector4(0, 0, -1, 0)) },
       openings: { value: openings },
       openingCount: { value: openingCount },
       hazeColor: { value: new Color(0x0a4967) },
     },
-    vertexShader: `varying vec3 vWorld; void main(){vec4 world=modelMatrix*vec4(position,1.0);vWorld=world.xyz;gl_Position=projectionMatrix*viewMatrix*world;}`,
+    vertexShader: `uniform float time;uniform vec3 playerPosition;varying vec3 vWorld;
+      ${SWELL_GLSL}
+      void main(){
+        vec4 world=modelMatrix*vec4(position,1.0);world.xz+=playerPosition.xz;
+        world.y+=swell(world.xz);vWorld=world.xyz;gl_Position=projectionMatrix*viewMatrix*world;
+      }`,
     fragmentShader: `uniform float time; uniform vec3 playerPosition; uniform vec3 impactPosition;
       uniform float impactTime; uniform float impactStrength; uniform vec3 hazeColor;
-      uniform vec3 openings[64]; uniform int openingCount; varying vec3 vWorld;
+      uniform vec3 openings[64]; uniform int openingCount;uniform vec4 debrisImpacts[8]; varying vec3 vWorld;
+      ${SWELL_GLSL}
       float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
       float noise(vec2 p){
         vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
         return mix(mix(hash(i),hash(i+vec2(1.0,0.0)),f.x),mix(hash(i+vec2(0.0,1.0)),hash(i+vec2(1.0)),f.x),f.y);
       }
       float heightAt(vec2 p){
-        return noise(p*0.16+vec2(time*0.08,time*0.035))*0.065
+        return swell(p)+noise(p*0.16+vec2(time*0.08,time*0.035))*0.065
           +noise(p*0.57+vec2(-time*0.06,time*0.1))*0.016;
       }
       void main(){
@@ -189,11 +226,14 @@ export function createCoastalEnvironment(route: TrackRoute): Group {
         // Keep the water legible at the entry: a deep-blue base, cyan fresnel,
         // and a small wave lift read as water without hiding the dive geometry.
         vec3 water=mix(vec3(0.008,0.050,0.120),vec3(0.020,0.280,0.440),0.22+fresnel*0.78);
-        float waveLift=smoothstep(0.018,0.075,height);
+        float waveLift=smoothstep(-0.06,0.28,height);
         water+=vec3(0.000,0.115,0.185)*waveLift*(0.55+fresnel*0.45);
         vec3 sunDirection=normalize(vec3(230.0,35.0,9.0));
         float glint=pow(max(0.0,dot(reflect(-sunDirection,normal),view)),190.0);
-        water+=vec3(0.18,0.72,0.92)*glint*0.72;
+        vec3 reflection=reflect(-view,normal);
+        vec3 skyReflection=mix(vec3(0.72,0.19,0.32),vec3(0.08,0.025,0.18),smoothstep(0.0,0.6,reflection.y));
+        water=mix(water,skyReflection,fresnel*0.42);
+        water+=vec3(1.0,0.65,0.32)*glint*0.85;
         water+=vec3(0.000,0.026,0.050)*(height-0.04);
         // This band peaks just below the surface and fades in the deep route,
         // keeping the cliff landing clear without making the whole ocean flat.
@@ -220,6 +260,12 @@ export function createCoastalEnvironment(route: TrackRoute): Group {
           *(0.55+0.45*sin(impactDistance*3.2+impactAge*8.0));
         water+=vec3(0.000,0.26,0.42)*radialRipple;
         water+=vec3(0.015,0.22,0.36)*radialCaustic*(0.6+fresnel*0.4);
+        for(int i=0;i<8;i++){
+          vec4 hit=debrisImpacts[i];if(hit.z<0.0)continue;
+          float gap=length(vWorld.xz-hit.xy);
+          float ring=exp(-pow((gap-hit.z*7.0)/(0.2+hit.z*0.35),2.0));
+          water+=vec3(0.16,0.35,0.39)*ring*exp(-hit.z*2.1)*hit.w;
+        }
         float waterOpacity=mix(0.84,0.54,submerged)-entryBand*0.16
           +radialRipple*0.12+radialCaustic*0.045;
         gl_FragColor=vec4(water,clamp(waterOpacity,0.34,0.94));
@@ -227,10 +273,10 @@ export function createCoastalEnvironment(route: TrackRoute): Group {
         #include <colorspace_fragment>
       }`,
   });
-  const ocean = new Mesh(new PlaneGeometry(1600, 1600), waterMaterial);
+  const ocean = new Mesh(oceanGeometry(quality), waterMaterial);
   ocean.name = "rift-coastal-water-surface";
-  ocean.rotation.x = -Math.PI / 2;
   ocean.position.y = -1.8;
+  ocean.frustumCulled = false;
   environment.add(ocean);
   const seabed = new Mesh(new PlaneGeometry(1600, 1600), new MeshStandardMaterial({
     name: "rift-seabed-material", color: 0x16404b, emissive: 0x05212b,

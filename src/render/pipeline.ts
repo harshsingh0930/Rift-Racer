@@ -72,6 +72,18 @@ export class RenderPipeline {
     } else this.renderer.render(this.scene, this.camera);
   }
 
+  /** Allocate and draw the otherwise dormant refraction pass during loading. */
+  prepareTransitions(): void {
+    if (!this.composer || !this.waterPass) return;
+    const enabled = this.waterPass.enabled;const wetness = this.waterPass.uniforms.wetness.value;
+    try {
+      this.waterPass.enabled = true;this.waterPass.uniforms.wetness.value = 0;
+      this.resize();this.composer.render(0);
+    } finally {
+      this.waterPass.enabled = enabled;this.waterPass.uniforms.wetness.value = wetness;
+    }
+  }
+
   waterImpact(): void { this.impactAge = 0;this.wetness = 1; }
   resetWater(): void { this.impactAge = 1;this.wetness = 0;if (this.waterPass) this.waterPass.enabled = false; }
   updateWater(delta: number, submerged: boolean): void {

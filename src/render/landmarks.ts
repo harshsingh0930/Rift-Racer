@@ -4,8 +4,11 @@ import {
   MeshStandardMaterial, Quaternion, RepeatWrapping, SRGBColorSpace, TorusGeometry, Vector3,
 } from "three";
 import { sampleTrackPosition, sampleTrackTangent, sampleTrackWidth, type TrackRoute, type Vector3Like } from "../game/track";
-import { getDiveLayout, SEA_LEVEL } from "../game/cliff-dive";
+import { getDiveLayout } from "../game/cliff-dive";
 import type { QualityTier } from "../game/performance";
+import { WoodSplashPool } from "./wood-splash";
+import { stepWoodShard, type WoodShard } from "../game/wood-debris";
+import { oceanSurfaceHeight } from "../game/ocean";
 
 const UP = new Vector3(0, 1, 0);
 const FORWARD = new Vector3(0, 0, 1);
@@ -103,12 +106,11 @@ function woodTexture(): DataTexture {
   return texture;
 }
 
-type Debris = {
-  pivot: Group;
-  side: number;
-  row: number;
+type Debris = WoodShard & {
+  origin: Vector3;
+  initialRotation: Quaternion;
   baseX: number;
-  baseY: number;
+  seed: number;
 };
 
 /** An exposed cliff end with a wooden breakaway at the cliff lip. */
@@ -118,25 +120,29 @@ export class CliffDiveTransition {
   private readonly barrier = new Group();
   private readonly debris = new Group();
   private readonly fragments: Debris[] = [];
+  private readonly splashes = new WoodSplashPool();
+  private shardMesh?: InstancedMesh<BufferGeometry, MeshStandardMaterial>;
+  private readonly launchTangent = new Vector3();
+  private readonly lateral = new Vector3();
+  private readonly matrix = new Matrix4();
+  private readonly renderScale = new Vector3();
+  private readonly scratch = new Vector3();
+  private oceanTime = 0;
   private previousFocus?: number;
   private elapsed = 0;
   private triggered = false;
-  private debrisLifetime = 3.2;
+  private readonly debrisLifetime = 12;
 
-  constructor(private readonly route: TrackRoute, lift: number, quality: QualityTier) {
+  constructor(private readonly route: TrackRoute, lift: number, quality: QualityTier,
+    private readonly onDebrisSplash?: (position: Vector3, strength: number) => void) {
     this.group.name = "rift-cliff-transition";
     this.layout = getDiveLayout(route);
     if (!this.layout) return;
     const { boardDistance, approachStart, entranceDistance } = this.layout;
     const width = sampleTrackWidth(route, boardDistance);
-    const launchHeight = sampleTrackPosition(route, boardDistance).y + lift;
-    const landingHeight = sampleTrackPosition(route, this.layout.boundary).y + lift;
-    const diveDuration = (1.5 + Math.sqrt(1.5 ** 2 + 2 * 9.81 * Math.max(1, launchHeight - landingHeight))) / 9.81;
-    const seaFallTime = Math.sqrt(Math.max(0, launchHeight - SEA_LEVEL) / 4.9);
-    // Keep the shards on screen until the same descent window as the car. They
-    // disappear only after reaching the water, rather than vanishing in air.
-    this.debrisLifetime = Math.max(3.2, Math.min(4.4, Math.max(diveDuration, seaFallTime) + 0.28));
     const lip = new Group();lip.name = "rift-cliff-lip";placeOnRoute(lip, route, boardDistance, lift);this.group.add(lip);
+    lip.updateMatrix();this.launchTangent.copy(sampleTrackTangent(route, boardDistance)).setY(0).normalize();
+    this.lateral.crossVectors(UP, this.launchTangent).normalize();this.group.add(this.splashes);
     const rockMaterial = new MeshStandardMaterial({ color: 0x55315d, roughness: 0.95,
       emissive: 0x221132, emissiveIntensity: 0.2, flatShading: true, side: DoubleSide });
     const faceGeometry = new BufferGeometry();
@@ -176,8 +182,8 @@ export class CliffDiveTransition {
       const cliff = new Mesh(geometry, rockMaterial);cliff.name = side < 0 ? "rift-cliff-wall-left" : "rift-cliff-wall-right";
       cliff.receiveShadow = true;this.group.add(cliff);
     }
-    const wood = new MeshStandardMaterial({ name: "rift-cliff-neon-timber", color: 0x3d2751,
-      map: woodTexture(), metalness: 0.2, roughness: 0.62, emissive: 0x180c2c, emissiveIntensity: 0.48 });
+    const wood = new MeshStandardMaterial({ name: "rift-cliff-neon-timber", color: 0x805258,
+      map: woodTexture(), metalness: 0, roughness: 0.9, emissive: 0x180c2c, emissiveIntensity: 0.18 });
     const frameMaterial = new MeshStandardMaterial({ name: "rift-cliff-neon-frame", color: 0x11152e,
       metalness: 0.82, roughness: 0.3, emissive: 0x17133d, emissiveIntensity: 0.8 });
     const cyanGlow = new MeshBasicMaterial({ name: "rift-cliff-cyan-edge", color: new Color(0x62f4ff).multiplyScalar(2.3),
@@ -189,7 +195,7 @@ export class CliffDiveTransition {
     this.barrier.userData.hitPoints = 1;
     this.barrier.userData.dynamicVisibility = true;
     this.debris.name = "rift-cliff-board-debris";this.debris.userData.dynamicVisibility = true;
-    lip.add(this.barrier, this.debris);
+    lip.add(this.barrier);this.group.add(this.debris);
     for (const side of [-1, 1]) {
       const post = new Mesh(new BoxGeometry(0.24, 3.8, 0.26), wood);
       post.position.set(side * (width / 2 + 0.7), 1.9, 0.2);this.barrier.add(post);
@@ -212,20 +218,33 @@ export class CliffDiveTransition {
     signBacking.position.set(0, 1.7, 0.12);this.barrier.add(signBacking);
     const plankSpan = width + 1.2;
     const plankHeight = 0.32;
-    const chunkCount = 4;
+    const chunkCount = quality === "eco" ? 6 : 8;
     for (let row = 0; row < 4; row++) {
       const plank = new Mesh(timber, wood);plank.position.set(0, 0.42 + row * 0.5, 0.22);
       plank.scale.set(plankSpan, plankHeight, 0.14);this.barrier.add(plank);
       const chunkWidth = plankSpan / chunkCount;
       for (let chunk = 0; chunk < chunkCount; chunk += 1) {
         const baseX = -plankSpan / 2 + chunkWidth / 2 + chunk * chunkWidth;
-        const side = baseX < 0 ? -1 : 1;
-        const pivot = new Group();const baseY = plank.position.y;
-        pivot.position.set(baseX, baseY, 0.22);
-        const fragment = new Mesh(timber, wood);fragment.scale.set(chunkWidth - 0.055, plankHeight, 0.14);
-        pivot.add(fragment);this.debris.add(pivot);this.fragments.push({ pivot, side, row, baseX, baseY });
+        const index = this.fragments.length;const seed = (Math.sin((index + 1) * 127.1) * 43758.5453) % 1;
+        const origin = new Vector3(baseX, plank.position.y, 0.22).applyMatrix4(lip.matrix);
+        const rotation = lip.quaternion.clone();
+        const floatRotation = new Quaternion().setFromAxisAngle(UP, seed * Math.PI * 2)
+          .multiply(new Quaternion().setFromAxisAngle(new Vector3(1, 0, 0), Math.PI / 2));
+        this.fragments.push({ origin, initialRotation: rotation.clone(), position: origin.clone(), velocity: new Vector3(), rotation,
+          angularVelocity: new Vector3(), size: new Vector3(chunkWidth * (0.78 + Math.abs(seed) * 0.2), plankHeight, 0.14),
+          floatRotation, baseX, seed, wet: false, impactSpeed: 0 });
       }
     }
+    const shardGeometry = new BoxGeometry(1, 1, 1);
+    const tips = shardGeometry.getAttribute("position");
+    for (let index = 0; index < tips.count; index++) {
+      const x = tips.getX(index);
+      if (Math.abs(x) > 0.49) tips.setX(index, x - Math.sign(x) * (tips.getY(index) < 0 ? 0.16 : tips.getZ(index) < 0 ? 0.07 : 0));
+    }
+    shardGeometry.computeVertexNormals();
+    this.shardMesh = new InstancedMesh(shardGeometry, wood, this.fragments.length);
+    this.shardMesh.name = "rift-cliff-board-shards";this.shardMesh.frustumCulled = false;
+    this.debris.add(this.shardMesh);
     // An open structural arch, always present; no translucent rectangle covering the driveable opening.
     const entrance = new Group();entrance.name = "rift-deep-water-entrance";
     placeOnRoute(entrance, route, entranceDistance, lift + 0.2);
@@ -241,41 +260,78 @@ export class CliffDiveTransition {
 
   reset(): void {
     this.previousFocus = undefined;this.triggered = false;this.elapsed = 0;
-    this.barrier.visible = true;this.debris.visible = false;
+    this.splashes.reset();this.barrier.visible = true;this.debris.visible = false;
     this.barrier.userData.hitPoints = 1;
-    this.fragments.forEach(({ pivot, baseX, baseY }) => {
-      pivot.position.set(baseX, baseY, 0.22);
-      pivot.rotation.set(0, 0, 0);
+    this.fragments.forEach(shard => {
+      shard.position.copy(shard.origin);shard.rotation.copy(shard.initialRotation);
+      shard.velocity.set(0, 0, 0);shard.angularVelocity.set(0, 0, 0);shard.wet = false;shard.impactSpeed = 0;
     });
-    this.group.userData.transitionTriggered = false;
+    this.group.userData.transitionTriggered = false;this.group.userData.waterImpacts = 0;
+    this.writeShardMatrices(1);
   }
 
-  update(delta: number, focus: number | undefined, speed: number, player?: Vector3Like): void {
-    if (!this.layout || focus === undefined) return;
-    const distance = this.layout.boardDistance;
-    let advance = this.previousFocus === undefined ? 0 : focus - this.previousFocus;
-    if (this.route.closed && Math.abs(advance) > this.route.totalLength / 2) advance -= Math.sign(advance) * this.route.totalLength;
-    const gap = distance - focus;
-    const crossed = this.previousFocus !== undefined && this.previousFocus < distance - 2.2 && focus >= distance - 2.2 && advance > 0;
-    const point = sampleTrackPosition(this.route, focus);
-    const nearRoad = !player || Math.hypot(player.x - point.x, player.y - point.y, player.z - point.z) < sampleTrackWidth(this.route, focus) / 2 + 1;
-    if (!this.triggered && nearRoad && speed > 0.4 && advance >= 0 && ((gap <= 2.2 && gap >= -2.2) || crossed)) {
-      this.triggered = true;this.elapsed = 0;this.barrier.userData.hitPoints = 0;
-      this.group.userData.transitionTriggered = true;
-    }
-    this.previousFocus = focus;
-    this.barrier.visible = !this.triggered;
-    this.debris.visible = this.triggered && this.elapsed < this.debrisLifetime;
-    if (!this.triggered) return;
-    this.elapsed += delta;
-    const time = this.elapsed;
-    this.fragments.forEach(({ pivot, side, row, baseX, baseY }) => {
-      pivot.position.set(
-        baseX + side * time * (7.5 + row * 1.3),
-        baseY + time * (3.5 + row * 0.65) - 5.2 * time * time,
-        0.22 + time * (5.5 + row * 0.8),
-      );
-      pivot.rotation.set(time * (3.2 + row * 0.6), side * time * 2.2, side * time * (2.8 + row * 0.8));
+  private breakTimber(speed: number, player?: Vector3Like): void {
+    if (!this.layout) return;
+    this.triggered = true;this.elapsed = 0;this.barrier.userData.hitPoints = 0;
+    this.group.userData.transitionTriggered = true;
+    const center = sampleTrackPosition(this.route, this.layout.boardDistance);
+    const impactX = player ? this.scratch.set(player.x, player.y, player.z).sub(center).dot(this.lateral) : 0;
+    this.fragments.forEach((shard, index) => {
+      const offset = shard.baseX - impactX;
+      const proximity = Math.exp(-offset * offset / 7);
+      const forwardSpeed = Math.max(1, speed) * (0.30 + proximity * 0.64) + 1.5 + Math.abs(shard.seed) * 3;
+      shard.velocity.copy(this.launchTangent).multiplyScalar(forwardSpeed)
+        .addScaledVector(this.lateral, Math.sign(offset) * (0.7 + proximity * 1.8) + shard.seed);
+      shard.velocity.y = 0.6 + Math.abs(shard.seed) * 3.4;
+      shard.angularVelocity.set(Math.sin(index * 1.7) * 4.2, Math.cos(index * 2.3) * 2.6, shard.seed * 5);
     });
+  }
+
+  private writeShardMatrices(fade: number): void {
+    if (!this.shardMesh) return;
+    this.fragments.forEach((shard, index) => {
+      this.renderScale.copy(shard.size).multiplyScalar(fade);
+      this.matrix.compose(shard.position, shard.rotation, this.renderScale);
+      this.shardMesh!.setMatrixAt(index, this.matrix);
+    });
+    this.shardMesh.instanceMatrix.needsUpdate = true;
+  }
+
+  update(delta: number, focus: number | undefined, speed: number, player?: Vector3Like, oceanTime?: number): void {
+    if (!this.layout || focus === undefined) return;
+    this.oceanTime = oceanTime ?? this.oceanTime + delta;
+    if (this.route.closed && focus < 40 && this.previousFocus !== undefined && this.previousFocus > this.route.totalLength - 80) this.reset();
+    if (!this.triggered) {
+      const distance = this.layout.boardDistance;
+      let advance = this.previousFocus === undefined ? 0 : focus - this.previousFocus;
+      if (this.route.closed && Math.abs(advance) > this.route.totalLength / 2) advance -= Math.sign(advance) * this.route.totalLength;
+      const gap = distance - focus;
+      const crossed = this.previousFocus !== undefined && this.previousFocus < distance - 2.2 && focus >= distance - 2.2 && advance > 0;
+      if (speed > 0.4 && advance >= 0 && ((gap <= 2.2 && gap >= -2.2) || crossed)) {
+        const point = sampleTrackPosition(this.route, focus);
+        const nearRoad = !player || Math.hypot(player.x - point.x, player.y - point.y, player.z - point.z) < sampleTrackWidth(this.route, focus) / 2 + 1;
+        if (nearRoad) this.breakTimber(speed, player);
+      }
+    }
+    this.previousFocus = focus;this.barrier.visible = !this.triggered;
+    this.debris.visible = this.triggered && this.elapsed < this.debrisLifetime;
+    if (this.debris.visible && delta > 0) {
+      this.elapsed += delta;
+      const steps = Math.max(1, Math.ceil(delta * 120));const dt = delta / steps;
+      for (let substep = 0; substep < steps; substep++) {
+        const time = this.oceanTime - delta + (substep + 1) * dt;
+        for (const shard of this.fragments) {
+          const surface = oceanSurfaceHeight(shard.position.x, shard.position.z, time);
+          if (stepWoodShard(shard, dt, surface)) {
+            this.scratch.copy(shard.position);this.scratch.y = surface;
+            this.splashes.emit(this.scratch, shard.impactSpeed);
+            this.onDebrisSplash?.(this.scratch, Math.min(0.6, 0.15 + shard.impactSpeed / 80));
+            this.group.userData.waterImpacts++;
+          }
+        }
+      }
+      this.writeShardMatrices(Math.max(0, Math.min(1, (this.debrisLifetime - this.elapsed) / 2)));
+    }
+    this.splashes.update(delta, this.oceanTime);
   }
 }
