@@ -5,59 +5,181 @@
  * imported by SSR code and exercised from a Node/Vitest environment.
  */
 
-export type QualityTier = 'eco' | 'balanced' | 'high';
+import type { StorageLike } from './storage';
+
+/** Profiles that can be selected by a player and persisted locally. */
+export type QualityProfile = 'eco' | 'balanced' | 'ultra';
+
+/** Quality values accepted by the renderer and scene modules. */
+export type QualityTier = QualityProfile;
+
+/** Alias for callers that use tier terminology for the public profiles. */
+export type SelectableQualityTier = QualityProfile;
+
+export type ShadowQuality = 'off' | 'standard' | 'high';
 
 export interface QualitySettings {
   /** Multiplier applied to the renderer's drawing-buffer resolution. */
   resolutionScale: number;
   /** Multiplier applied to the base particle budget. */
   particleMultiplier: number;
+  /** Multiplier for pooled visual effects created by the scene adapters. */
+  effectScale: number;
   /** Optional absolute cap for systems that use a particle budget. */
   maxParticles?: number;
   /** Optional renderer hints kept with the preset for callers that use them. */
   antialias?: boolean;
   shadows?: boolean;
   postProcessing?: boolean;
+  /** Enable dynamic scene lights in the host renderer. */
+  realTimeLighting: boolean;
+  /** Spelling used by the car renderer's quality option. */
+  realtimeLighting?: boolean;
+  /** Shadow-map mode requested by the host renderer. */
+  shadowQuality: ShadowQuality;
 }
 
 const ECO_SETTINGS: QualitySettings = Object.freeze({
   resolutionScale: 0.75,
   particleMultiplier: 0.5,
+  effectScale: 0.65,
   maxParticles: 700,
   antialias: false,
   shadows: false,
   postProcessing: false,
+  realTimeLighting: false,
+  realtimeLighting: false,
+  shadowQuality: 'off',
 });
 
 const BALANCED_SETTINGS: QualitySettings = Object.freeze({
   resolutionScale: 1,
   particleMultiplier: 1,
+  effectScale: 1,
   maxParticles: 1_400,
   antialias: true,
   shadows: true,
   postProcessing: true,
+  realTimeLighting: true,
+  realtimeLighting: true,
+  shadowQuality: 'standard',
 });
 
-const HIGH_SETTINGS: QualitySettings = Object.freeze({
-  resolutionScale: 1.25,
-  particleMultiplier: 1.5,
-  maxParticles: 2_400,
+const ULTRA_SETTINGS: QualitySettings = Object.freeze({
+  resolutionScale: 1.5,
+  particleMultiplier: 1.75,
+  effectScale: 1.35,
+  maxParticles: 3_200,
   antialias: true,
   shadows: true,
   postProcessing: true,
+  realTimeLighting: true,
+  realtimeLighting: true,
+  shadowQuality: 'high',
 });
 
 /** Default settings used by each supported quality tier. */
-export const QUALITY_SETTINGS: Readonly<Record<QualityTier, QualitySettings>> =
+export const QUALITY_SETTINGS: Readonly<Record<QualityProfile, QualitySettings>> =
   Object.freeze({
     eco: ECO_SETTINGS,
     balanced: BALANCED_SETTINGS,
-    high: HIGH_SETTINGS,
+    ultra: ULTRA_SETTINGS,
   });
 
 /** Descriptive aliases for callers that prefer the word "preset". */
 export const QUALITY_PRESETS = QUALITY_SETTINGS;
 export const DEFAULT_QUALITY_SETTINGS = QUALITY_SETTINGS;
+
+/** Storage key used for the player's selected welcome-screen profile. */
+export const QUALITY_PROFILE_STORAGE_KEY = 'rift-racer.quality-profile';
+
+function parseQualityProfile(value: unknown): QualityProfile | undefined {
+  if (value === 'eco' || value === 'balanced' || value === 'ultra') {
+    return value;
+  }
+
+  // Migrate the previous public name without making it selectable again.
+  if (value === 'high') return 'ultra';
+  return undefined;
+}
+
+export function isQualityProfile(value: unknown): value is QualityProfile {
+  return parseQualityProfile(value) !== undefined;
+}
+
+/** Normalize persisted or externally supplied values to a public profile. */
+export function normalizeQualityProfile(
+  value: unknown,
+  fallback: QualityProfile = 'balanced',
+): QualityProfile {
+  return parseQualityProfile(value) ?? fallback;
+}
+
+/** Alias for callers that use tier terminology for the public profiles. */
+export const normalizeQualityTier = normalizeQualityProfile;
+
+function isStorageLike(value: unknown): value is StorageLike {
+  if (!value || (typeof value !== 'object' && typeof value !== 'function')) {
+    return false;
+  }
+
+  const candidate = value as Partial<StorageLike>;
+  return (
+    typeof candidate.getItem === 'function' &&
+    typeof candidate.setItem === 'function' &&
+    typeof candidate.removeItem === 'function'
+  );
+}
+
+function getDefaultStorage(): StorageLike | undefined {
+  try {
+    if (typeof globalThis === 'undefined') return undefined;
+
+    const candidate = (globalThis as unknown as { localStorage?: unknown }).localStorage;
+    return isStorageLike(candidate) ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read the selected profile without allowing storage failures to break boot. */
+export function readQualityProfile(
+  storage?: StorageLike | null,
+): QualityProfile | null {
+  const resolvedStorage = storage === undefined
+    ? getDefaultStorage()
+    : storage ?? undefined;
+  if (!resolvedStorage) return null;
+
+  try {
+    return parseQualityProfile(resolvedStorage.getItem(QUALITY_PROFILE_STORAGE_KEY)) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Persist a public profile; returns false when local storage is unavailable. */
+export function saveQualityProfile(
+  profile: QualityProfile,
+  storage?: StorageLike | null,
+): boolean {
+  if (!isQualityProfile(profile)) return false;
+
+  const resolvedStorage = storage === undefined
+    ? getDefaultStorage()
+    : storage ?? undefined;
+  if (!resolvedStorage) return false;
+
+  try {
+    resolvedStorage.setItem(QUALITY_PROFILE_STORAGE_KEY, profile);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export const readStoredQualityProfile = readQualityProfile;
+export const writeQualityProfile = saveQualityProfile;
 
 export interface MediaQueryLike {
   matches?: boolean;
@@ -267,8 +389,10 @@ export const getDeviceCapabilities = probeCapabilities;
 /** Pick a conservative initial tier from the probed capabilities. */
 export function recommendQualityTier(
   capabilities: PerformanceCapabilities = probeCapabilities(),
-): QualityTier {
-  if (!capabilities.webgl) {
+): QualityProfile {
+  // Three.js r180's WebGLRenderer requires WebGL 2. A WebGL 1-only probe is
+  // not a usable renderer capability, so keep the initial profile conservative.
+  if (!capabilities.webgl2) {
     return 'eco';
   }
 
@@ -287,7 +411,7 @@ export function recommendQualityTier(
     capabilities.maxTextureSize >= 4096;
 
   if (highMemory && highCoreCount && highTextureLimit) {
-    return 'high';
+    return 'ultra';
   }
 
   return 'balanced';
@@ -299,7 +423,7 @@ export type GovernorDirection = 'up' | 'down' | 'hold';
 
 export interface FrameTimeGovernorOptions {
   targetFrameTime?: number;
-  initialTier?: QualityTier;
+  initialTier?: QualityProfile;
   initialSettings?: Partial<QualitySettings>;
   minResolutionScale?: number;
   maxResolutionScale?: number;
@@ -374,7 +498,7 @@ export class FrameTimeGovernor {
     );
     this.maxResolutionScale = Math.max(
       this.minResolutionScale,
-      clamp(finiteOr(options.maxResolutionScale, 1.25), 0.1, 4),
+      clamp(finiteOr(options.maxResolutionScale, 1.5), 0.1, 4),
     );
     this.minParticleMultiplier = clamp(
       finiteOr(options.minParticleMultiplier, 0.25),
@@ -383,7 +507,7 @@ export class FrameTimeGovernor {
     );
     this.maxParticleMultiplier = Math.max(
       this.minParticleMultiplier,
-      clamp(finiteOr(options.maxParticleMultiplier, 1.5), 0, 10),
+      clamp(finiteOr(options.maxParticleMultiplier, 2), 0, 10),
     );
     this.targetFrameTime = Math.max(
       1,

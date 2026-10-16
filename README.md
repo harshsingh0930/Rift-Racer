@@ -1,6 +1,6 @@
-# Violet Rift Racer
+# Rift Racer
 
-Violet Rift Racer is a local, single-player arcade driving prototype built for
+Rift Racer is a local, single-player arcade driving prototype built for
 the Buildathon. The game uses a custom movement model rather than a full
 physics engine. The first route moves from a coastal boulevard through a
 tunnel and into an underwater section before returning to the coast.
@@ -25,7 +25,8 @@ The game logic is intentionally renderer- and UI-independent:
   grip, and soft-wall collision helpers.
 - `src/game/track.ts` builds and samples the deterministic route.
 - `src/game/performance.ts` probes browser capabilities, selects a quality
-  tier, and adapts resolution and particle budgets from frame time.
+  profile, persists the welcome-screen choice, and adapts resolution and
+  particle budgets from frame time.
 - `src/game/storage.ts` stores a best time in browser-local storage when that
   API is available.
 
@@ -34,15 +35,10 @@ existing `npm run build` script. It uses strict checking, ES2022 output
 semantics, Vite's bundler module resolution, DOM types, and no emit because
 Vite owns the final bundle.
 
-This snapshot currently contains the reusable game modules. Vite's conventional
-root entry (`index.html` plus a browser bootstrap that imports the modules) must
-be present for the dev server and production bundle to render a page. The
-package scripts and this README deliberately leave `package.json` unchanged.
-
-There is not yet a committed `package-lock.json` in this checkout. `npm
-install` is therefore the correct first install command. For strict dependency
-reproducibility, commit the generated lockfile in the project-owner change;
-once it exists, the Dockerfile automatically switches to `npm ci`.
+The browser entry (`index.html` plus `src/main.ts`) is included, so both the dev
+server and production bundle render the game. `package-lock.json` is also
+included for reproducible installs; use `npm ci` in CI or Docker and `npm
+install` when developing locally.
 
 ## Install and commands
 
@@ -89,20 +85,26 @@ translate events into this contract.
 
 ## Performance tiers and low-end goals
 
-`src/game/performance.ts` exposes three renderer presets:
+`src/game/performance.ts` exposes three renderer profiles:
 
-| Tier | Resolution scale | Particle multiplier / cap | Antialiasing | Shadows | Post-processing |
+| Tier | Resolution scale | Particle multiplier / cap | Antialiasing | Real-time lighting | Shadow quality |
 | --- | ---: | ---: | --- | --- | --- |
 | **Eco** | `0.75` | `0.5` / `700` | Off | Off | Off |
-| **Balanced** | `1.0` | `1.0` / `1,400` | On | On | On |
-| **High** | `1.25` | `1.5` / `2,400` | On | On | On |
+| **Balanced** | `1.0` | `1.0` / `1,400` | On | On | Standard |
+| **Ultra** | `1.5` | `1.75` / `3,200` | On | On | High |
 
-Initial selection is conservative: no WebGL, at most two hardware threads, or
-at most 2 GB of reported device memory selects Eco. High requires WebGL plus at
-least eight hardware threads, at least 8 GB of reported memory, and a 4096+
+Initial selection is conservative: no WebGL 2, at most two hardware threads, or
+at most 2 GB of reported device memory selects Eco. Ultra requires WebGL 2 plus
+at least eight hardware threads, at least 8 GB of reported memory, and a 4096+
 texture limit; other capable devices start at Balanced. Browser capability
 values are treated as hints and the game remains usable when a privacy setting
 omits them.
+
+The welcome screen also provides an explicit Eco/Balanced/Ultra selector. A
+selection is stored under `rift-racer.quality-profile` in local storage and is
+used on the next reload. When changed while the title screen is ready, Rift
+Racer safely rebuilds the quality-sensitive scene groups before the next run.
+Older locally stored `high` values are migrated to Ultra.
 
 The adaptive frame-time governor targets roughly 16.7 ms per frame (60 FPS).
 It lowers resolution and particle budgets when frames remain slow and restores
@@ -116,6 +118,13 @@ Balanced target is 60 FPS on a typical modern laptop. These are buildathon
 targets to verify on representative hardware, not a claim about every browser
 or GPU.
 
+### Browser graphics requirement
+
+Rift Racer uses Three.js with WebGL 2. The welcome screen and graphics error
+screen call out the requirement directly. If the browser reports an unavailable
+or exhausted graphics driver, enable hardware acceleration in the browser
+settings and reload the game; without it the 3D route cannot run as intended.
+
 ## Docker
 
 The included multi-stage Dockerfile uses the existing npm scripts. It installs
@@ -123,8 +132,8 @@ dependencies, runs `npm run build`, and serves the resulting bundle with Vite
 Preview on port 4173:
 
 ```bash
-docker build -t violet-rift-racer .
-docker run --rm -p 4173:4173 violet-rift-racer
+docker build -t rift-racer .
+docker run --rm -p 4173:4173 rift-racer
 ```
 
 Open <http://localhost:4173> after the container starts. The container command
@@ -134,7 +143,6 @@ is equivalent to:
 npm run preview -- --host 0.0.0.0 --port 4173
 ```
 
-If a `package-lock.json` is present, the build stage uses `npm ci`; otherwise
-it falls back to `npm install` so this initial checkout remains buildable. As
-with local `npm run build`, the browser entrypoint must exist before the
-container can produce a page.
+The build stage uses `npm ci` from the checked-in lockfile. As with local
+`npm run build`, the browser entrypoint is compiled before the container serves
+the page.

@@ -5,7 +5,7 @@
  * private/sandboxed contexts). Every access is therefore optional and guarded.
  */
 
-export const BEST_TIME_STORAGE_KEY = 'violet-rift-racer.best-time';
+export const BEST_TIME_STORAGE_KEY = 'rift-racer.best-time';
 export const BEST_TIME_KEY = BEST_TIME_STORAGE_KEY;
 
 export interface StorageLike {

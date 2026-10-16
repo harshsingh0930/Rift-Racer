@@ -3,6 +3,7 @@ node_modules/
 npm-debug.log*
 # Vite and build output
 .vite/
+dist/
 coverage/
 *.tsbuildinfo
 # Local environment and editor files
@@ -20,3 +21,6 @@ Thumbs.db
 *.local
 *.tmp
 *.swp
+
+
+DESIGN.md

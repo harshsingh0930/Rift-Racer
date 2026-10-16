@@ -4,7 +4,7 @@ import { Vector3 } from "three";
 export type ArcadeInput = {
   /** Forward (+1) or reverse (-1) acceleration. */
   throttle?: number;
-  /** Steering, where positive turns toward +X at heading 0. */
+  /** Steering, where positive turns toward the player's right. */
   steer?: number;
   /** A brake/handbrake amount from 0 to 1. */
   brake?: number;
@@ -159,7 +159,10 @@ function forwardForHeading(heading: number): Vector3 {
 }
 
 function rightForHeading(heading: number): Vector3 {
-  return new Vector3(Math.cos(heading), 0, -Math.sin(heading));
+  // The car faces +Z at heading zero and the chase camera follows from behind.
+  // From that view, the player's right is -X, opposite the direction of
+  // increasing Y rotation.
+  return new Vector3(-Math.cos(heading), 0, Math.sin(heading));
 }
 
 /**
@@ -270,7 +273,7 @@ export function applySteering(
   const travelDirection = forwardSpeed < -EPSILON ? -1 : 1;
   const driftBoost = 1 + Math.max(0, next.drift) * tuning.driftSteeringBoost;
   const headingDelta =
-    next.steering * tuning.steeringRate * steeringAuthority * travelDirection * driftBoost * delta;
+    -next.steering * tuning.steeringRate * steeringAuthority * travelDirection * driftBoost * delta;
 
   next.heading = wrapAngle(next.heading + headingDelta);
   if (Math.abs(headingDelta) > EPSILON) {

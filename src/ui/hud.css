@@ -1,0 +1,748 @@
+/*
+ * Rift Racer HUD
+ *
+ * The game canvas can sit underneath this layer. Every visual is namespaced
+ * with vrr-hud so the host entry point can import this file without leaking
+ * selectors into the rest of the scene.
+ */
+
+:root {
+  --vrr-violet: #b968ff;
+  --vrr-violet-bright: #e6b2ff;
+  --vrr-cyan: #4de7ff;
+  --vrr-pink: #ff5ebc;
+  --vrr-lime: #d7ff36;
+  --vrr-ink: #090718;
+  --vrr-panel: rgba(9, 7, 24, 0.82);
+  --vrr-line: rgba(216, 157, 255, 0.3);
+  --vrr-speed-progress: 0;
+}
+
+.vrr-hud {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  grid-template-columns: minmax(15rem, 20rem) minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  align-content: space-between;
+  gap: clamp(0.7rem, 1.8vw, 1.4rem);
+  padding: clamp(0.8rem, 2.8vw, 2.35rem);
+  box-sizing: border-box;
+  color: #f8efff;
+  font-family: "Rajdhani", "Bahnschrift", "Segoe UI", sans-serif;
+  letter-spacing: 0.08em;
+  pointer-events: none;
+  text-shadow: 0 0 1.25rem rgba(185, 104, 255, 0.3);
+}
+
+.vrr-hud button,
+.vrr-hud output {
+  font: inherit;
+}
+
+.vrr-hud__topline {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: clamp(0.7rem, 2vw, 1.4rem);
+}
+
+.vrr-hud__lap-card,
+.vrr-hud__best-times,
+.vrr-hud__controls {
+  border: 1px solid var(--vrr-line);
+  background: linear-gradient(135deg, rgba(20, 12, 47, 0.9), var(--vrr-panel));
+  box-shadow: inset 0 0 2rem rgba(127, 67, 255, 0.13), 0 0.7rem 2rem rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(0.7rem);
+}
+
+.vrr-hud__lap-card {
+  min-width: 0;
+  width: min(20rem, 100%);
+  padding: 0.9rem 1.05rem 0.8rem;
+  clip-path: polygon(0 0, 100% 0, 100% calc(100% - 0.75rem), calc(100% - 0.75rem) 100%, 0 100%);
+}
+
+.vrr-hud__lap-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.7rem;
+}
+
+.vrr-hud__eyebrow,
+.vrr-hud__panel-heading,
+.vrr-hud__speed-caption,
+.vrr-hud__speed-heading,
+.vrr-hud__controls-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  color: var(--vrr-cyan);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+}
+
+.vrr-hud__checkered {
+  width: 1.25rem;
+  height: 0.6rem;
+  display: inline-block;
+  background:
+    linear-gradient(45deg, rgba(255, 255, 255, 0.95) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.95) 75%),
+    linear-gradient(45deg, rgba(255, 255, 255, 0.95) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.95) 75%);
+  background-position: 0 0, 0.3rem 0.3rem;
+  background-size: 0.6rem 0.6rem;
+  background-color: var(--vrr-violet);
+  box-shadow: 0 0 0.6rem rgba(77, 231, 255, 0.8);
+}
+
+.vrr-hud__lap-time {
+  display: block;
+  margin: 0.15rem 0 0.25rem;
+  color: var(--vrr-violet-bright);
+  font-family: "Roboto Mono", "Cascadia Mono", monospace;
+  font-size: clamp(2rem, 5vw, 3.35rem);
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  line-height: 1;
+  text-shadow: 0 0 0.6rem rgba(185, 104, 255, 0.86), 0 0 2rem rgba(185, 104, 255, 0.5);
+}
+
+.vrr-hud__race-time-label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  color: rgba(248, 239, 255, 0.56);
+  font-family: "Roboto Mono", "Cascadia Mono", monospace;
+  font-size: 0.55rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  white-space: nowrap;
+}
+
+.vrr-hud__race-time-label output {
+  color: var(--vrr-cyan);
+  letter-spacing: 0;
+}
+
+.vrr-hud__lap-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  color: rgba(248, 239, 255, 0.78);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.vrr-hud__best-label {
+  color: var(--vrr-pink);
+}
+
+.vrr-hud__controls {
+  align-self: stretch;
+  width: min(22rem, 100%);
+  padding: 0.58rem 0.65rem 0.65rem;
+  pointer-events: auto;
+}
+
+.vrr-hud__controls-heading {
+  justify-content: space-between;
+  margin-bottom: 0.45rem;
+  color: rgba(248, 239, 255, 0.7);
+  font-size: 0.55rem;
+  letter-spacing: 0.18em;
+}
+
+.vrr-hud__controls-status {
+  color: var(--vrr-lime);
+  font-family: "Roboto Mono", "Cascadia Mono", monospace;
+  font-size: 0.5rem;
+  letter-spacing: 0.1em;
+}
+
+.vrr-hud__control-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.45rem;
+}
+
+.vrr-hud__toggle,
+.vrr-hud__restart {
+  border: 1px solid rgba(77, 231, 255, 0.46);
+  color: #f8efff;
+  background: rgba(9, 7, 24, 0.76);
+  cursor: pointer;
+  transition: border-color 160ms ease, color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+}
+
+.vrr-hud__toggle {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.55rem 0.65rem;
+  text-align: left;
+}
+
+.vrr-hud__toggle:hover,
+.vrr-hud__toggle:focus-visible,
+.vrr-hud__restart:hover,
+.vrr-hud__restart:focus-visible {
+  border-color: var(--vrr-cyan);
+  color: var(--vrr-cyan);
+  box-shadow: 0 0 1rem rgba(77, 231, 255, 0.28);
+  outline: none;
+  transform: translateY(-1px);
+}
+
+.vrr-hud__toggle[data-active="true"] {
+  border-color: rgba(185, 104, 255, 0.8);
+  box-shadow: inset 0 0 1.1rem rgba(185, 104, 255, 0.15);
+}
+
+.vrr-hud__toggle-icon {
+  color: var(--vrr-pink);
+  font-size: 1.2rem;
+  line-height: 1;
+}
+
+.vrr-hud__toggle-copy {
+  display: grid;
+  gap: 0.12rem;
+  font-size: 0.58rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+}
+
+.vrr-hud__toggle-copy strong {
+  color: var(--vrr-cyan);
+  font-size: 0.7rem;
+}
+
+.vrr-hud__speed-panel {
+  grid-column: 2;
+  grid-row: 2;
+  align-self: end;
+  justify-self: end;
+  position: relative;
+  width: min(32rem, 44vw);
+  min-width: 19rem;
+  min-height: 14rem;
+  padding-top: 1.3rem;
+  pointer-events: none;
+}
+
+.vrr-hud__speed-heading {
+  position: absolute;
+  z-index: 1;
+  inset: 0.2rem 1rem auto;
+  justify-content: space-between;
+  color: rgba(230, 178, 255, 0.65);
+  font-size: 0.55rem;
+  letter-spacing: 0.18em;
+}
+
+.vrr-hud__speed-heading span:last-child {
+  color: var(--vrr-cyan);
+  font-family: "Roboto Mono", "Cascadia Mono", monospace;
+  font-size: 0.5rem;
+  letter-spacing: 0.06em;
+}
+
+.vrr-hud__speedometer {
+  position: absolute;
+  inset: 1rem 0 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.vrr-hud__speed-track,
+.vrr-hud__speed-track-inner,
+.vrr-hud__speed-arc {
+  fill: none;
+  stroke-linecap: round;
+  stroke-width: 5;
+}
+
+.vrr-hud__speed-track {
+  stroke: rgba(185, 104, 255, 0.18);
+}
+
+.vrr-hud__speed-track-inner {
+  stroke: rgba(77, 231, 255, 0.1);
+  stroke-width: 2;
+  stroke-dasharray: 1 9;
+}
+
+.vrr-hud__speed-arc {
+  stroke: var(--vrr-cyan);
+  stroke-dasharray: 402.124 402.124;
+  filter: drop-shadow(0 0 0.38rem var(--vrr-cyan)) drop-shadow(0 0 1rem rgba(185, 104, 255, 0.55));
+  transition: stroke-dashoffset 120ms linear;
+}
+
+.vrr-hud__speed-ticks line {
+  stroke: rgba(230, 178, 255, 0.75);
+  stroke-width: 1.5;
+}
+
+.vrr-hud__speed-readout {
+  position: absolute;
+  left: 50%;
+  top: 51%;
+  display: flex;
+  align-items: baseline;
+  transform: translate(-50%, -50%);
+}
+
+.vrr-hud__speed-value {
+  color: #ffffff;
+  font-family: "Roboto Mono", "Cascadia Mono", monospace;
+  font-size: clamp(2.6rem, 7vw, 5rem);
+  font-weight: 700;
+  letter-spacing: -0.06em;
+  line-height: 1;
+  text-shadow: 0 0 0.7rem var(--vrr-cyan), 0 0 2.2rem rgba(77, 231, 255, 0.62);
+}
+
+.vrr-hud__speed-unit {
+  margin-left: 0.55rem;
+  color: var(--vrr-cyan);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+}
+
+.vrr-hud__distance {
+  position: absolute;
+  left: 50%;
+  bottom: 1.65rem;
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  color: rgba(248, 239, 255, 0.5);
+  font-size: 0.52rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+.vrr-hud__distance strong {
+  color: rgba(248, 239, 255, 0.82);
+  font-family: "Roboto Mono", "Cascadia Mono", monospace;
+  font-size: 0.75rem;
+  letter-spacing: 0.03em;
+}
+
+.vrr-hud__speed-caption {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  color: var(--vrr-pink);
+  font-size: 0.57rem;
+}
+
+.vrr-hud__pulse {
+  width: 0.42rem;
+  height: 0.42rem;
+  border-radius: 50%;
+  background: var(--vrr-pink);
+  box-shadow: 0 0 0.65rem var(--vrr-pink);
+}
+
+.vrr-hud__best-times {
+  grid-column: 1;
+  grid-row: 3;
+  align-self: end;
+  width: min(19rem, 72vw);
+  padding: 0.85rem 1rem 0.95rem;
+}
+
+.vrr-hud__panel-heading {
+  justify-content: space-between;
+  color: var(--vrr-violet-bright);
+  font-size: 0.62rem;
+}
+
+.vrr-hud__panel-count {
+  color: var(--vrr-cyan);
+  font-family: "Roboto Mono", "Cascadia Mono", monospace;
+  font-size: 0.58rem;
+}
+
+.vrr-hud__best-list {
+  display: grid;
+  gap: 0.32rem;
+  margin: 0.7rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.vrr-hud__best-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.3rem 0.35rem;
+  border-bottom: 1px solid rgba(185, 104, 255, 0.14);
+  color: rgba(248, 239, 255, 0.82);
+  font-family: "Roboto Mono", "Cascadia Mono", monospace;
+  font-size: 0.76rem;
+}
+
+.vrr-hud__best-rank {
+  color: var(--vrr-pink);
+}
+
+.vrr-hud__best-time {
+  color: var(--vrr-cyan);
+}
+
+.vrr-hud__best-empty {
+  margin: 0.7rem 0 0;
+  color: rgba(248, 239, 255, 0.52);
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+}
+
+.vrr-hud__results {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+  background: rgba(4, 2, 16, 0.65);
+  pointer-events: auto;
+  backdrop-filter: blur(0.35rem);
+}
+
+.vrr-hud__results[hidden] {
+  display: none;
+}
+
+.vrr-hud__results-card {
+  width: min(28rem, 100%);
+  padding: clamp(1.5rem, 5vw, 2.5rem);
+  border: 1px solid rgba(230, 178, 255, 0.58);
+  background: linear-gradient(145deg, rgba(31, 14, 65, 0.98), rgba(8, 6, 27, 0.97));
+  box-shadow: 0 0 3rem rgba(104, 55, 255, 0.3), inset 0 0 2rem rgba(185, 104, 255, 0.1);
+  text-align: center;
+  clip-path: polygon(0 0, calc(100% - 1.1rem) 0, 100% 1.1rem, 100% 100%, 1.1rem 100%, 0 calc(100% - 1.1rem));
+}
+
+.vrr-hud__results-kicker {
+  color: var(--vrr-cyan);
+  font-size: 0.64rem;
+  font-weight: 700;
+  letter-spacing: 0.24em;
+}
+
+.vrr-hud__results-card h2 {
+  margin: 0.45rem 0 0;
+  color: var(--vrr-violet-bright);
+  font-size: clamp(2rem, 7vw, 3rem);
+  letter-spacing: 0.12em;
+}
+
+.vrr-hud__results-time {
+  margin-top: 0.3rem;
+  color: #ffffff;
+  font-family: "Roboto Mono", "Cascadia Mono", monospace;
+  font-size: clamp(2rem, 7vw, 3.2rem);
+  font-weight: 700;
+  text-shadow: 0 0 1rem var(--vrr-violet);
+}
+
+.vrr-hud__new-best {
+  display: inline-block;
+  margin-top: 0.5rem;
+  padding: 0.25rem 0.5rem;
+  color: var(--vrr-ink);
+  background: var(--vrr-cyan);
+  font-size: 0.57rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+}
+
+.vrr-hud__new-best[hidden] {
+  display: none;
+}
+
+.vrr-hud__results-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.55rem;
+  margin: 1.3rem 0;
+  color: rgba(248, 239, 255, 0.62);
+  font-size: 0.54rem;
+  letter-spacing: 0.12em;
+}
+
+.vrr-hud__results-stats span {
+  display: grid;
+  gap: 0.18rem;
+}
+
+.vrr-hud__results-stats b {
+  color: var(--vrr-violet-bright);
+  font-family: "Roboto Mono", "Cascadia Mono", monospace;
+  font-size: 0.75rem;
+  letter-spacing: 0;
+}
+
+.vrr-hud__restart {
+  width: 100%;
+  padding: 0.8rem 1rem;
+  border-color: rgba(255, 94, 188, 0.68);
+  color: var(--vrr-pink);
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.15em;
+  pointer-events: auto;
+}
+
+.vrr-hud__start-state {
+  position: absolute;
+  z-index: 4;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 0.35rem;
+  padding: 2rem;
+  color: #fff;
+  text-align: center;
+  pointer-events: none;
+  text-shadow: 0 0 1rem rgba(77, 231, 255, 0.56), 0 0 3rem rgba(185, 104, 255, 0.45);
+}
+
+.vrr-hud__start-state[hidden] {
+  display: none;
+}
+
+.vrr-hud__start-kicker {
+  color: var(--vrr-cyan);
+  font-size: clamp(0.65rem, 1.2vw, 0.82rem);
+  font-weight: 800;
+  letter-spacing: 0.32em;
+}
+
+.vrr-hud__start-value {
+  color: var(--vrr-lime);
+  font-family: "Roboto Mono", "Cascadia Mono", monospace;
+  font-size: clamp(4rem, 13vw, 8.5rem);
+  font-weight: 700;
+  letter-spacing: -0.1em;
+  line-height: 0.82;
+  text-shadow: 0 0 1rem rgba(215, 255, 54, 0.8), 0 0 4rem rgba(255, 81, 201, 0.55);
+}
+
+.vrr-hud__start-state[data-phase="go"] .vrr-hud__start-value {
+  color: var(--vrr-pink);
+  animation: vrr-go-pulse 420ms ease-out both;
+}
+
+.vrr-hud__start-copy {
+  color: rgba(248, 239, 255, 0.74);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+}
+
+@keyframes vrr-go-pulse {
+  0% { transform: scale(1.16); opacity: 0.4; }
+  70% { transform: scale(1); opacity: 1; }
+  100% { transform: scale(0.96); opacity: 0.94; }
+}
+
+@media (max-width: 720px) {
+  .vrr-hud {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    padding: 0.75rem;
+  }
+
+  .vrr-hud__topline {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    flex: none;
+    gap: 0.55rem;
+  }
+
+  .vrr-hud__lap-card,
+  .vrr-hud__best-times {
+    width: auto;
+    min-width: 0;
+  }
+
+  .vrr-hud__controls {
+    width: auto;
+    align-self: stretch;
+    padding: 0.5rem;
+  }
+
+  .vrr-hud__control-grid {
+    grid-template-columns: 1fr;
+    gap: 0.35rem;
+  }
+
+  .vrr-hud__toggle {
+    min-width: 5.2rem;
+    padding: 0.45rem 0.5rem;
+  }
+
+  .vrr-hud__speed-panel {
+    flex: 1 1 auto;
+    width: min(29rem, 100%);
+    min-width: 0;
+    min-height: 9.6rem;
+    margin: auto auto 0;
+    justify-self: center;
+  }
+
+  .vrr-hud__best-times {
+    flex: none;
+    width: min(19rem, 100%);
+    align-self: flex-start;
+  }
+
+  .vrr-hud__results-stats {
+    gap: 0.45rem;
+  }
+}
+
+@media (max-width: 480px) {
+  .vrr-hud {
+    padding: 0.55rem;
+  }
+
+  .vrr-hud__lap-card {
+    padding: 0.72rem 0.78rem 0.68rem;
+  }
+
+  .vrr-hud__lap-time {
+    font-size: clamp(1.8rem, 10vw, 2.55rem);
+  }
+
+  .vrr-hud__lap-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+
+  .vrr-hud__race-time-label {
+    display: grid;
+    gap: 0.08rem;
+    margin-left: 1.7rem;
+    font-size: 0.46rem;
+  }
+
+  .vrr-hud__lap-meta {
+    font-size: 0.62rem;
+  }
+
+  .vrr-hud__controls {
+    width: 7.3rem;
+    padding: 0.42rem;
+  }
+
+  .vrr-hud__controls-heading {
+    margin: 0 0 0.35rem;
+  }
+
+  .vrr-hud__controls-heading span:first-child {
+    display: none;
+  }
+
+  .vrr-hud__control-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .vrr-hud__toggle {
+    aspect-ratio: 1;
+    min-width: 0;
+    place-items: center;
+    padding: 0.25rem;
+  }
+
+  .vrr-hud__toggle-copy {
+    display: none;
+  }
+
+  .vrr-hud__toggle-icon {
+    font-size: 1.05rem;
+  }
+
+  .vrr-hud__speed-panel {
+    min-height: 8.45rem;
+    padding-top: 0.8rem;
+  }
+
+  .vrr-hud__speed-heading {
+    inset: 0.1rem 0.4rem auto;
+    font-size: 0.48rem;
+  }
+
+  .vrr-hud__speed-heading span:last-child {
+    font-size: 0.45rem;
+  }
+
+  .vrr-hud__speed-readout {
+    top: 53%;
+  }
+
+  .vrr-hud__speed-value {
+    font-size: clamp(2.35rem, 14vw, 3.7rem);
+  }
+
+  .vrr-hud__speed-unit {
+    margin-left: 0.35rem;
+    font-size: 0.58rem;
+  }
+
+  .vrr-hud__distance {
+    bottom: 1.25rem;
+    font-size: 0.44rem;
+  }
+
+  .vrr-hud__distance strong {
+    font-size: 0.64rem;
+  }
+
+  .vrr-hud__speed-caption {
+    font-size: 0.47rem;
+  }
+
+  .vrr-hud__best-times {
+    padding: 0.55rem 0.7rem 0.6rem;
+  }
+
+  .vrr-hud__best-list {
+    max-height: 3.5rem;
+    overflow: hidden;
+  }
+
+  .vrr-hud__best-empty {
+    margin-top: 0.45rem;
+    font-size: 0.62rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vrr-hud__speed-arc,
+  .vrr-hud__toggle,
+  .vrr-hud__restart,
+  .vrr-hud__start-value {
+    transition: none;
+    animation: none;
+  }
+}

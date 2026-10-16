@@ -1,12 +1,12 @@
 {
-  "name": "violet-rift-racer",
+  "name": "rift-racer",
   "private": true,
   "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "test": "vitest run",
+    "test": "vitest run --pool=threads --poolOptions.threads.singleThread",
     "preview": "vite preview"
   },
   "dependencies": {

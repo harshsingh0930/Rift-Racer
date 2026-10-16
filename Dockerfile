@@ -4,14 +4,9 @@ FROM node:22-alpine AS build
 
 WORKDIR /app
 
-# Keep dependency installation cacheable. The repository currently has no
-# lockfile, so fall back to npm install until one is committed.
+# Keep dependency installation cacheable and reproducible from the lockfile.
 COPY package*.json ./
-RUN if [ -f package-lock.json ]; then \
-      npm ci --no-audit --no-fund; \
-    else \
-      npm install --no-audit --no-fund; \
-    fi
+RUN npm ci --no-audit --no-fund
 
 COPY . .
 RUN npm run build
