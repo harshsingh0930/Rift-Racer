@@ -1,0 +1,16 @@
+.git
+node_modules
+dist
+coverage
+artifacts
+.omnirush
+.opencode
+.env
+.env.*
+!.env.example
+*.log
+*.local
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
