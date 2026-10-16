@@ -26,6 +26,8 @@ export type ArcadeTuning = {
   lateralGrip: number;
   /** Lateral velocity damping while drifting (lower means more slide). */
   driftGrip: number;
+  /** Maximum combined tyre acceleration in m/s²; tuned for arcade handling. */
+  corneringGrip: number;
   steeringRate: number;
   steeringResponse: number;
   driftResponse: number;
@@ -83,21 +85,23 @@ export type ArcadeUpdateOptions = {
 };
 
 export const DEFAULT_ARCADE_TUNING: Readonly<ArcadeTuning> = {
-  maxSpeed: 34,
-  reverseMaxSpeed: 11,
-  acceleration: 42,
-  reverseAcceleration: 22,
-  braking: 68,
-  rollingDrag: 0.7,
-  lateralGrip: 9,
+  // World units are metres; 84 m/s is approximately 302 km/h.
+  maxSpeed: 84,
+  reverseMaxSpeed: 9,
+  acceleration: 14,
+  reverseAcceleration: 10,
+  braking: 22,
+  rollingDrag: 0.035,
+  lateralGrip: 16,
   driftGrip: 1.7,
-  steeringRate: 2.4,
+  corneringGrip: 64,
+  steeringRate: 2.25,
   steeringResponse: 9,
   driftResponse: 10,
   driftLateralResponse: 8,
   driftLateralSpeed: 0.65,
   driftSteeringBoost: 0.35,
-  steeringVelocityInfluence: 0.55,
+  steeringVelocityInfluence: 0.86,
   wallBounce: 0.18,
   wallFriction: 0.78,
   wallCorrection: 1,
@@ -134,7 +138,7 @@ function copyVector(value: Vector3Like | undefined): Vector3 {
   return value ? new Vector3(value.x, value.y, value.z) : new Vector3();
 }
 
-function cloneCarState(state: CarState): CarState {
+export function cloneCarState(state: CarState): CarState {
   return {
     ...state,
     position: state.position.clone(),
@@ -203,6 +207,11 @@ export function applyResponsiveAcceleration(
 
   const forward = forwardForHeading(next.heading);
   const forwardSpeed = next.velocity.dot(forward);
+  const directionalBrake = (inputState.throttle < 0 && forwardSpeed > 0.5)
+    || (inputState.throttle > 0 && forwardSpeed < -0.5);
+  const effectiveBrake = Math.max(inputState.brake, directionalBrake ? Math.abs(inputState.throttle) : 0);
+  if (directionalBrake) next.throttle = 0;
+  next.brake = effectiveBrake;
   const lateralVelocity = next.velocity
     .clone()
     .addScaledVector(forward, -forwardSpeed);
@@ -213,15 +222,15 @@ export function applyResponsiveAcceleration(
   const acceleration =
     inputState.throttle >= 0 ? tuning.acceleration : tuning.reverseAcceleration;
 
-  let adjustedForwardSpeed = approach(
-    forwardSpeed,
-    targetSpeed,
-    Math.max(0, acceleration) * delta,
-  );
+  // Lifting off disengages engine drive. It must not command a zero-speed
+  // target with the same force used to accelerate the car.
+  let adjustedForwardSpeed = Math.abs(inputState.throttle) > EPSILON && !directionalBrake
+    ? approach(forwardSpeed, targetSpeed, Math.max(0, acceleration) * delta)
+    : forwardSpeed;
   adjustedForwardSpeed = approach(
     adjustedForwardSpeed,
     0,
-    Math.max(0, tuning.braking) * inputState.brake * delta,
+    Math.max(0, tuning.braking) * effectiveBrake * delta,
   );
 
   next.velocity
@@ -256,10 +265,11 @@ export function applySteering(
   const tuning = resolveTuning(tuningOverrides);
   const delta = positiveDelta(deltaSeconds);
 
+  const speedSensitivity = clamp(state.speed / tuning.maxSpeed, 0, 1);
   next.steering = approach(
     next.steering,
     inputState.steer,
-    Math.max(0, tuning.steeringResponse) * delta,
+    Math.max(0, tuning.steeringResponse) * (1 - speedSensitivity * 0.3) * delta,
   );
 
   const forward = forwardForHeading(next.heading);
@@ -272,12 +282,22 @@ export function applySteering(
   const steeringAuthority = 0.12 + speedRatio * 0.88;
   const travelDirection = forwardSpeed < -EPSILON ? -1 : 1;
   const driftBoost = 1 + Math.max(0, next.drift) * tuning.driftSteeringBoost;
+  const speedReduction = 1 - speedRatio * 0.23;
   const headingDelta =
-    -next.steering * tuning.steeringRate * steeringAuthority * travelDirection * driftBoost * delta;
+    -next.steering * tuning.steeringRate * steeringAuthority * speedReduction * travelDirection * driftBoost * delta;
 
   next.heading = wrapAngle(next.heading + headingDelta);
   if (Math.abs(headingDelta) > EPSILON) {
-    next.velocity.applyAxisAngle(UP, headingDelta * tuning.steeringVelocityInfluence);
+    next.velocity.applyAxisAngle(UP, headingDelta * tuning.steeringVelocityInfluence * (1 - next.drift * 0.55));
+  }
+  if (next.speed > 5 && forwardSpeed > 0) {
+    const velocityHeading = Math.atan2(next.velocity.x, next.velocity.z);
+    const slip = wrapAngle(velocityHeading - next.heading);
+    // Rear tyre self-alignment gives a slide a recoverable equilibrium,
+    // rather than allowing the body to spin independently of its travel.
+    const alignment = Math.max(0, Math.abs(slip) - 0.1)
+      * (2.6 + (1 - Math.abs(inputState.steer)) * 3.4);
+    next.heading = wrapAngle(next.heading + Math.sign(slip) * Math.min(Math.abs(slip), alignment * delta));
   }
   next.speed = next.velocity.length();
   return next;
@@ -298,10 +318,21 @@ export function applyBrakeAssistedDrift(
   const inputState = normalizeInput(input);
   const tuning = resolveTuning(tuningOverrides);
   const delta = positiveDelta(deltaSeconds);
-  const brakeDrift = inputState.brake * Math.abs(inputState.steer);
-  const targetDrift = Math.max(inputState.drift, brakeDrift);
+  const forwardSpeedBeforeBraking = next.velocity.dot(forwardForHeading(next.heading));
+  const downBraking = inputState.throttle < 0 && forwardSpeedBeforeBraking > 0.5;
+  const effectiveBrake = Math.max(inputState.brake, downBraking ? Math.abs(inputState.throttle) : 0);
+  const brakeDrift = effectiveBrake * Math.abs(inputState.steer);
+  const speedRatio = clamp(Math.abs(forwardSpeedBeforeBraking) / tuning.maxSpeed, 0, 1);
+  const steeringDemand = Math.max(Math.abs(next.steering), Math.abs(inputState.steer) * 0.35);
+  const yawDemand = steeringDemand * tuning.steeringRate * (0.12 + speedRatio * 0.88) * (1 - speedRatio * 0.23);
+  const lateralDemand = Math.abs(forwardSpeedBeforeBraking) * yawDemand;
+  const availableGrip = tuning.corneringGrip * Math.sqrt(1 - effectiveBrake * effectiveBrake * 0.3);
+  const corneringSlip = clamp((lateralDemand - availableGrip) / (availableGrip * 0.8), 0, 0.85);
+  const velocitySlip = Math.abs(Math.atan2(next.velocity.dot(rightForHeading(next.heading)), Math.abs(forwardSpeedBeforeBraking) + 0.1));
+  const measuredSlip = Math.abs(forwardSpeedBeforeBraking) > 8 ? clamp((velocitySlip - 0.09) / 0.4, 0, 0.85) : 0;
+  const targetDrift = Math.max(inputState.drift, brakeDrift, corneringSlip, measuredSlip);
 
-  next.brake = inputState.brake;
+  next.brake = effectiveBrake;
   next.drift = approach(
     next.drift,
     targetDrift,
@@ -414,9 +445,21 @@ export function updateCarState(
   const delta = positiveDelta(deltaSeconds);
   const tuning = resolveTuning(options.tuning);
   let next = applyResponsiveAcceleration(state, input, delta, tuning);
+  const drivenVelocity = next.velocity.clone();
   next = applyBrakeAssistedDrift(next, input, delta, tuning);
   next = applySteering(next, input, delta, tuning);
   next = applyGripAndFriction(next, delta, tuning);
+  // A friction circle caps the total cornering impulse. The car cannot rotate
+  // its velocity instantly just because the steering wheel changed direction.
+  const corneringImpulse = next.velocity.clone().sub(drivenVelocity);
+  const brakeAcceleration = Math.min(tuning.corneringGrip, tuning.braking * next.brake);
+  const availableAcceleration = Math.sqrt(Math.max(1, tuning.corneringGrip ** 2 - brakeAcceleration ** 2))
+    * (1 - next.drift * 0.22);
+  const impulseLimit = availableAcceleration * delta;
+  if (corneringImpulse.length() > impulseLimit) {
+    corneringImpulse.setLength(impulseLimit);
+    next.velocity.copy(drivenVelocity).add(corneringImpulse);
+  }
   next.position.addScaledVector(next.velocity, delta);
   if (options.walls) next = resolveSoftWallCollision(next, options.walls, tuning);
   next.speed = next.velocity.length();

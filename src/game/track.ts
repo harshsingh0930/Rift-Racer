@@ -1,6 +1,12 @@
 import { CatmullRomCurve3, Vector3 } from "three";
 
-export type TrackSection = "coastal-boulevard" | "tunnel" | "underwater";
+export type TrackSection =
+  | "coastal-boulevard"
+  | "causeway"
+  | "tunnel"
+  | "cliff-dive"
+  | "underwater"
+  | "final-skyline";
 
 /** A renderer-ready control point in world space. */
 export type TrackPoint = {
@@ -208,55 +214,51 @@ export function findNearestTrackPoint(
   route: TrackRoute,
   query: Vector3Like,
 ): NearestTrackPoint {
-  const queryPosition = new Vector3(query.x, query.y, query.z);
   let bestDistanceSquared = Number.POSITIVE_INFINITY;
-  let bestPosition = new Vector3();
-  let bestTangent = new Vector3(0, 0, 1);
+  const bestPosition = new Vector3();
+  const bestTangent = new Vector3(0, 0, 1);
   let bestDistanceAlong = 0;
   let bestWidth = 0;
   let bestSegmentIndex = 0;
   let bestSection: TrackSection = "coastal-boulevard";
 
   for (const segment of route.segments) {
-    const direction = new Vector3().subVectors(
-      segment.end.position,
-      segment.start.position,
-    );
-    const lengthSquared = direction.lengthSq();
+    const start = segment.start.position;
+    const end = segment.end.position;
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const dz = end.z - start.z;
+    const lengthSquared = dx * dx + dy * dy + dz * dz;
     const amount =
       lengthSquared <= EPSILON
         ? 0
         : clamp(
-            new Vector3()
-              .subVectors(queryPosition, segment.start.position)
-              .dot(direction) / lengthSquared,
+            ((query.x - start.x) * dx + (query.y - start.y) * dy + (query.z - start.z) * dz) / lengthSquared,
             0,
             1,
           );
-    const candidate = new Vector3().lerpVectors(
-      segment.start.position,
-      segment.end.position,
-      amount,
-    );
-    const distanceSquared = queryPosition.distanceToSquared(candidate);
+    const x = start.x + dx * amount;
+    const y = start.y + dy * amount;
+    const z = start.z + dz * amount;
+    const distanceSquared = (query.x - x) ** 2 + (query.y - y) ** 2 + (query.z - z) ** 2;
 
     if (distanceSquared < bestDistanceSquared) {
       bestDistanceSquared = distanceSquared;
-      bestPosition = candidate;
+      bestPosition.set(x, y, z);
       bestDistanceAlong = segment.startDistance + amount * segment.length;
       bestWidth = segment.start.width + (segment.end.width - segment.start.width) * amount;
       bestSegmentIndex = segment.index;
       bestSection = segment.section;
-      if (lengthSquared > EPSILON) bestTangent.copy(direction).normalize();
+      if (lengthSquared > EPSILON) bestTangent.set(dx, dy, dz).normalize();
     }
   }
 
   if (!Number.isFinite(bestDistanceSquared)) {
     const fallback = route.points[0];
-    bestPosition = fallback.position.clone();
+    bestPosition.copy(fallback.position);
     bestWidth = fallback.width;
     bestSection = fallback.section;
-    bestDistanceSquared = queryPosition.distanceToSquared(bestPosition);
+    bestDistanceSquared = (query.x - bestPosition.x) ** 2 + (query.y - bestPosition.y) ** 2 + (query.z - bestPosition.z) ** 2;
   }
 
   return {
@@ -301,26 +303,67 @@ const trackPoint = (
 });
 
 /**
- * The first playable route slice: a sunny coastal boulevard dives through a
- * short tunnel, then drops below the water before returning to the coast.
- * Coordinates are deterministic and intentionally modest for easy scene setup.
+ * The first playable route: a coastal boulevard climbs onto a causeway,
+ * threads a refined tunnel, dives into a long underwater return, and finishes
+ * through a final skyline loop before rejoining the harbor start. The last
+ * approach is tangent-aligned with the first span so the closed loop has no
+ * visible snap at the start line.
  */
 export const SAMPLE_TRACK_POINTS: readonly TrackPoint[] = [
   trackPoint(0, 0, 0, "coastal-boulevard", "harbor start"),
-  trackPoint(42, 0, 0, "coastal-boulevard", "palm straight"),
-  trackPoint(82, 2, -20, "coastal-boulevard", "cliff bend"),
-  trackPoint(96, 4, -58, "coastal-boulevard", "tunnel mouth"),
-  trackPoint(70, 5, -98, "tunnel", "tunnel entry", 11),
-  trackPoint(24, 4, -116, "tunnel", "tunnel curve", 11),
-  trackPoint(-26, 3, -108, "tunnel", "tunnel exit", 11),
-  trackPoint(-64, 1, -84, "coastal-boulevard", "shoreline ramp", 11),
-  trackPoint(-88, -4, -48, "underwater", "descent", 14),
-  trackPoint(-96, -10, -4, "underwater", "sunken straight", 14),
-  trackPoint(-86, -12, 36, "underwater", "reef bend", 14),
-  trackPoint(-54, -9, 58, "underwater", "kelp tunnel", 14),
-  trackPoint(-24, -4, 48, "underwater", "ascent", 14),
-  trackPoint(-32, 0, 18, "coastal-boulevard", "surfacing bend"),
-  trackPoint(-24, 0, 0, "coastal-boulevard", "harbor approach"),
+  trackPoint(55, 0, -8, "coastal-boulevard", "palm straight"),
+  trackPoint(110, 1, -28, "coastal-boulevard", "cliff bend"),
+  trackPoint(155, 3, -65, "coastal-boulevard", "boulevard overlook"),
+  trackPoint(180, 4, -105, "coastal-boulevard", "causeway approach"),
+
+  trackPoint(215, 5, -145, "causeway", "causeway entry", 13),
+  trackPoint(255, 6, -155, "causeway", "open water span", 13),
+  trackPoint(285, 7, -115, "causeway", "causeway bend", 13),
+  trackPoint(300, 8, -55, "causeway", "lantern pylons", 13),
+  trackPoint(295, 8, 10, "causeway", "tunnel approach", 13),
+  trackPoint(275, 7, 65, "causeway", "tunnel mouth", 12),
+
+  trackPoint(245, 6, 105, "tunnel", "tunnel entry", 11),
+  trackPoint(190, 5, 128, "tunnel", "tunnel ribs east", 11),
+  trackPoint(120, 4, 138, "tunnel", "tunnel gallery", 11),
+  trackPoint(45, 3, 140, "tunnel", "tunnel gallery west", 11),
+  trackPoint(-35, 12, 135, "tunnel", "tunnel lights", 11),
+  trackPoint(-110, 24, 120, "tunnel", "tunnel curve", 11),
+  trackPoint(-175, 30, 92, "tunnel", "tunnel exit ramp", 11),
+  trackPoint(-215, 31, 55, "tunnel", "tunnel exit", 12),
+  trackPoint(-230, 31, 15, "cliff-dive", "cliff lip", 12),
+
+  trackPoint(-250, -14, -150, "underwater", "underwater landing", 18),
+  trackPoint(-250, -17, -195, "underwater", "sunken straight", 14),
+  trackPoint(-235, -17, -235, "underwater", "reef bend", 14),
+  trackPoint(-185, -20, -265, "underwater", "kelp trench", 14),
+  trackPoint(-115, -21, -285, "underwater", "deep glassway", 14),
+  trackPoint(-35, -21, -290, "underwater", "deep glassway south", 14),
+  trackPoint(50, -19, -270, "underwater", "reef lights", 14),
+  trackPoint(125, -14, -240, "underwater", "ascent bend", 14),
+  trackPoint(190, -8, -195, "underwater", "surfacing gate", 14),
+
+  trackPoint(245, -1, -180, "final-skyline", "skyline surfacing", 13),
+  trackPoint(345, 7, -145, "final-skyline", "skyline east", 13),
+  trackPoint(365, 14, -95, "final-skyline", "skyline towers", 13),
+  trackPoint(350, 22, -45, "final-skyline", "skyline bend", 13),
+  // Cross the causeway once, with room for the road, car and chase camera.
+  trackPoint(300, 24, 5, "final-skyline", "causeway flyover", 13),
+  trackPoint(240, 22, 35, "final-skyline", "neon district", 13),
+  trackPoint(180, 16, 40, "final-skyline", "neon district north", 13),
+  trackPoint(90, 6, 55, "final-skyline", "skyline panorama", 13),
+  trackPoint(0, 3, 60, "final-skyline", "skyline panorama west", 13),
+  trackPoint(-90, 2, 50, "final-skyline", "skyline west", 13),
+  trackPoint(-120, 1, 40, "final-skyline", "skyline return", 13),
+  trackPoint(-145, 1, 25, "final-skyline", "harbor lights west", 13),
+  trackPoint(-175, 0, 18, "final-skyline", "harbor lights bend", 13),
+  trackPoint(-195, 0, 2, "final-skyline", "harbor lights west", 13),
+  trackPoint(-198, 0, -16, "final-skyline", "harbor lights", 13),
+  trackPoint(-175, 0, -28, "final-skyline", "harbor approach west", 13),
+  trackPoint(-135, 0, -30, "final-skyline", "harbor approach", 13),
+  trackPoint(-90, 0, -25, "final-skyline", "harbor approach east", 13),
+  trackPoint(-45, 0, -15, "final-skyline", "harbor approach straight", 13),
+  trackPoint(-20, 0, -5, "final-skyline", "start-line approach", 13),
 ];
 
 export const SAMPLE_ROUTE: TrackRoute = createSmoothTrackRoute(SAMPLE_TRACK_POINTS, true);

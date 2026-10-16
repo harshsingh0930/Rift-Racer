@@ -36,8 +36,7 @@
   text-shadow: 0 0 1.25rem rgba(185, 104, 255, 0.3);
 }
 
-.vrr-hud button,
-.vrr-hud output {
+.vrr-hud button {
   font: inherit;
 }
 
@@ -226,139 +225,66 @@
 
 .vrr-hud__speed-panel {
   grid-column: 2;
-  grid-row: 2;
+  grid-row: 2 / 4;
   align-self: end;
   justify-self: end;
   position: relative;
-  width: clamp(15rem, 23vw, 24rem);
-  min-width: 14rem;
-  min-height: 11rem;
-  padding-top: 1.3rem;
+  width: clamp(15rem, 24vw, 22rem);
+  aspect-ratio: 1;
+  color: #fff;
   pointer-events: none;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.85);
 }
-
-.vrr-hud__speed-heading {
-  position: absolute;
-  z-index: 1;
-  inset: 0.2rem 1rem auto;
-  justify-content: space-between;
-  color: rgba(230, 178, 255, 0.65);
-  font-size: 0.55rem;
-  letter-spacing: 0.18em;
-}
-
-.vrr-hud__speed-heading span:last-child {
-  color: var(--vrr-cyan);
-  font-family: "Roboto Mono", "Cascadia Mono", monospace;
-  font-size: 0.5rem;
-  letter-spacing: 0.06em;
-}
-
 .vrr-hud__speedometer {
   position: absolute;
-  inset: 1rem 0 0;
+  inset: 0;
   width: 100%;
   height: 100%;
   overflow: visible;
 }
-
 .vrr-hud__speed-track,
-.vrr-hud__speed-track-inner,
-.vrr-hud__speed-arc {
+.vrr-hud__redline {
   fill: none;
-  stroke-linecap: round;
-  stroke-width: 5;
+  stroke: rgba(255, 255, 255, 0.29);
+  stroke-width: 2.2;
 }
-
-.vrr-hud__speed-track {
-  stroke: rgba(185, 104, 255, 0.18);
+.vrr-hud__redline { stroke: #ff258e; stroke-width: 4; }
+.vrr-hud__speed-ticks line { stroke: rgba(255, 255, 255, 0.65); stroke-width: 1.7; }
+.vrr-hud__speed-ticks text { fill: rgba(255, 255, 255, 0.78); font-size: 12px; font-style: italic; letter-spacing: 0; }
+.vrr-hud__speed-ticks .vrr-hud__red-tick { stroke: #ff258e; fill: #ff258e; }
+.vrr-hud__rpm-label { fill: rgba(255, 255, 255, 0.45); font-size: 8px; letter-spacing: 1px; }
+.vrr-hud__rpm-needle { fill: white; filter: drop-shadow(0 0 3px rgba(255, 255, 255, 0.6)); }
+.vrr-hud__gear-ring { fill: rgba(0, 0, 0, 0.08); stroke: rgba(255, 255, 255, 0.27); stroke-width: 1; }
+.vrr-hud__gear {
+  position: absolute;
+  top: 50%; left: 50%;
+  display: flex; flex-direction: column; align-items: center;
+  transform: translate(-50%, -46%);
+  font-style: italic;
 }
-
-.vrr-hud__speed-track-inner {
-  stroke: rgba(77, 231, 255, 0.1);
-  stroke-width: 2;
-  stroke-dasharray: 1 9;
-}
-
-.vrr-hud__speed-arc {
-  stroke: var(--vrr-cyan);
-  stroke-dasharray: 402.124 402.124;
-  filter: drop-shadow(0 0 0.38rem var(--vrr-cyan)) drop-shadow(0 0 1rem rgba(185, 104, 255, 0.55));
-  transition: stroke-dashoffset 120ms linear;
-}
-
-.vrr-hud__speed-ticks line {
-  stroke: rgba(230, 178, 255, 0.75);
-  stroke-width: 1.5;
-}
-
+.vrr-hud__gear output { font-size: clamp(2.3rem, 4.2vw, 3.8rem); font-weight: 400; line-height: 0.9; }
+.vrr-hud__gear span { margin-top: 0.4rem; color: rgba(255, 255, 255, 0.5); font-size: 0.45rem; letter-spacing: 0.2em; }
 .vrr-hud__speed-readout {
-  position: absolute;
-  left: 50%;
-  top: 51%;
-  display: flex;
-  align-items: baseline;
-  transform: translate(-50%, -50%);
+  position: absolute; right: 3%; top: 62%;
+  display: flex; flex-direction: column; align-items: flex-end;
 }
-
 .vrr-hud__speed-value {
-  color: #ffffff;
-  font-family: "Roboto Mono", "Cascadia Mono", monospace;
-  font-size: clamp(2.6rem, 7vw, 5rem);
-  font-weight: 700;
-  letter-spacing: -0.06em;
-  line-height: 1;
-  text-shadow: 0 0 0.7rem var(--vrr-cyan), 0 0 2.2rem rgba(77, 231, 255, 0.62);
+  color: white; font-size: clamp(4.4rem, 9vw, 8rem);
+  font-family: 'Bahnschrift', 'Segoe UI', sans-serif;
+  font-style: italic; font-weight: 300;
+  letter-spacing: -0.06em; line-height: 0.95;
 }
-
 .vrr-hud__speed-unit {
-  margin-left: 0.55rem;
-  color: var(--vrr-cyan);
-  font-size: 0.75rem;
-  font-weight: 700;
-  letter-spacing: 0.16em;
+  color: rgba(255, 255, 255, 0.72); font-size: clamp(0.8rem, 1.4vw, 1.1rem);
+  font-weight: 400; font-style: italic; letter-spacing: 0.02em;
 }
-
 .vrr-hud__distance {
-  position: absolute;
-  left: 50%;
-  bottom: 1.65rem;
-  display: flex;
-  align-items: baseline;
-  gap: 0.45rem;
-  color: rgba(248, 239, 255, 0.5);
-  font-size: 0.52rem;
-  font-weight: 700;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  transform: translateX(-50%);
-  white-space: nowrap;
+  position: absolute; bottom: -0.4rem; right: 0;
+  display: flex; gap: 1rem; color: rgba(255, 255, 255, 0.5);
+  font-size: 0.5rem; font-weight: 400; letter-spacing: 0.1em;
 }
-
-.vrr-hud__distance strong {
-  color: rgba(248, 239, 255, 0.82);
-  font-family: "Roboto Mono", "Cascadia Mono", monospace;
-  font-size: 0.75rem;
-  letter-spacing: 0.03em;
-}
-
-.vrr-hud__speed-caption {
-  position: absolute;
-  left: 50%;
-  bottom: 0;
-  transform: translateX(-50%);
-  white-space: nowrap;
-  color: var(--vrr-pink);
-  font-size: 0.57rem;
-}
-
-.vrr-hud__pulse {
-  width: 0.42rem;
-  height: 0.42rem;
-  border-radius: 50%;
-  background: var(--vrr-pink);
-  box-shadow: 0 0 0.65rem var(--vrr-pink);
-}
+.vrr-hud__distance strong { font-weight: 400; }
+.vrr-hud[data-redline='true'] .vrr-hud__gear output { color: #ff258e; }
 
 .vrr-hud__best-times {
   grid-column: 1;
@@ -601,12 +527,12 @@
   }
 
   .vrr-hud__speed-panel {
-    flex: 1 1 auto;
-    width: min(29rem, 100%);
+    flex: none;
+    width: 14rem;
     min-width: 0;
-    min-height: 9.6rem;
-    margin: auto auto 0;
-    justify-self: center;
+    min-height: 0;
+    margin: auto 0 0 auto;
+    align-self: flex-end;
   }
 
   .vrr-hud__best-times {
@@ -683,8 +609,8 @@
   }
 
   .vrr-hud__speed-panel {
-    min-height: 8.45rem;
-    padding-top: 0.8rem;
+    width: 12.5rem;
+    min-height: 0;
   }
 
   .vrr-hud__speed-heading {
@@ -697,11 +623,11 @@
   }
 
   .vrr-hud__speed-readout {
-    top: 53%;
+    top: 62%;
   }
 
   .vrr-hud__speed-value {
-    font-size: clamp(2.35rem, 14vw, 3.7rem);
+    font-size: 5.2rem;
   }
 
   .vrr-hud__speed-unit {
@@ -710,7 +636,7 @@
   }
 
   .vrr-hud__distance {
-    bottom: 1.25rem;
+    bottom: -0.4rem;
     font-size: 0.44rem;
   }
 

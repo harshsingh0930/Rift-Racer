@@ -19,6 +19,9 @@ import {
 } from './game/arcade';
 import { RouteProgress } from './game/progress';
 import { RaceAudio } from './game/audio';
+import { CliffDive } from './game/cliff-dive';
+import { AutomaticTransmission } from './game/transmission';
+import { constrainCarToRoad } from './game/road-contact';
 import {
   findNearestTrackPoint,
   sampleTrackPosition,
@@ -41,16 +44,26 @@ import { createKeyboardInput, type KeyboardInputController } from './input';
 import { createRiftCar, type RiftCar } from './render/car';
 import { createRiftEffects, type RiftEffects } from './render/effects';
 import { createRiftWorld, type RiftWorld } from './render/world';
-import { ChaseCamera } from './render/camera';
+import { ChaseCamera, type CountdownCameraShot } from './render/camera';
 import { RenderPipeline } from './render/pipeline';
+import { createPaintEnvironment } from './render/lighting';
+import { preloadSceneryTextures } from './render/texture-assets';
 import { createRaceHud, type RaceHud } from './ui';
 
 const TOTAL_LAPS = 3;
-const WORLD_SPEED_TO_KMH = 7.75;
+const WORLD_SPEED_TO_KMH = 3.6;
+const transmission = new AutomaticTransmission();
+const cliffDive = new CliffDive(SAMPLE_ROUTE);
+let engineRpm = 950;
 const CAR_ROAD_LIFT = 0.045;
 const COUNTDOWN_STEP_SECONDS = 0.8;
 const COUNTDOWN_STEPS = 3;
 const GO_DISPLAY_SECONDS = 0.55;
+const COUNTDOWN_CAMERA_SHOTS: readonly CountdownCameraShot[] = [
+  'front-reveal',
+  'rear-chase',
+  'low-hero',
+];
 
 type GameStatus = 'loading' | 'ready' | 'countdown' | 'racing' | 'finished' | 'error';
 
@@ -180,7 +193,6 @@ function applyResolution(targetRenderer: WebGLRenderer, tier: QualityProfile, sc
 }
 
 function applyQualitySettings(
-  targetScene: Scene,
   targetRenderer: WebGLRenderer,
   tier: QualityProfile,
 ): void {
@@ -214,7 +226,7 @@ function createWorldForQuality(tier: QualityProfile): RiftWorld {
 
 function createEffectsForQuality(tier: QualityProfile): RiftEffects {
   const settings = QUALITY_SETTINGS[tier];
-  const baseSkidMarks = tier === 'eco' ? 24 : tier === 'ultra' ? 72 : 44;
+  const baseSkidMarks = tier === 'eco' ? 512 : tier === 'ultra' ? 4096 : 2048;
   const baseSparks = tier === 'eco' ? 48 : tier === 'ultra' ? 180 : 108;
 
   return createRiftEffects({
@@ -240,7 +252,10 @@ function createGovernorForQuality(tier: QualityProfile): FrameTimeGovernor {
   return new FrameTimeGovernor({
     initialTier: tier,
     initialSettings: settings,
-    maxResolutionScale: Math.max(1.5, settings.resolutionScale),
+    // Ultra is the player's explicit choice of image quality. Keep its full
+    // resolution instead of silently reducing it after compilation hitches.
+    minResolutionScale: tier === 'ultra' ? settings.resolutionScale : tier === 'balanced' ? 0.75 : 0.5,
+    maxResolutionScale: settings.resolutionScale,
     maxParticleMultiplier: Math.max(2, settings.particleMultiplier),
     targetFrameTime: tier === 'eco' ? 1000 / 30 : 1000 / 60,
     slowFrameThreshold: 8,
@@ -297,7 +312,7 @@ function rebuildQualityScene(nextQuality: QualityProfile): boolean {
   quality = nextQuality;
   requestedQuality = nextQuality;
   governor = createGovernorForQuality(nextQuality);
-  applyQualitySettings(scene, renderer, nextQuality);
+  applyQualitySettings(renderer, nextQuality);
   setHeadlights(headlightsEnabled);
   resetCarState();
   qualityLabel.textContent = formatQualityLabel(nextQuality);
@@ -331,6 +346,10 @@ function handleQualitySelection(): void {
 }
 
 function resetCarState(): void {
+  world?.resetTransitions();
+  cliffDive.reset();
+  transmission.reset();
+  engineRpm = 950;
   nearestTrackDistance = 0;
   const spawn = sampleTrackPosition(SAMPLE_ROUTE, 0, new Vector3());
   const tangent = sampleTrackTangent(SAMPLE_ROUTE, 0, new Vector3());
@@ -362,6 +381,8 @@ function resetCarState(): void {
     lapTimeMs: 0,
     raceTimeMs: 0,
     speedKmh: 0,
+    gear: 1,
+    rpm: 950,
     maxSpeedKmh: 0,
     distanceMeters: 0,
     bestLapTimeMs: null,
@@ -413,6 +434,9 @@ function returnToTitle(): void {
 
 function beginRaceAtGo(): void {
   status = 'racing';
+  // The first racing frame must use the regular chase rig, not a damped
+  // heading left over from the final countdown reveal.
+  chaseCamera?.reset();
   elapsedSeconds = 0;
   totalRaceTimeMs = 0;
   lapStartedAtMs = 0;
@@ -439,43 +463,32 @@ function finishRace(): void {
   });
 }
 
-function keepCarOnRoute(nextState: CarState, deltaSeconds: number): CarState {
-  const nearest = findNearestTrackPoint(SAMPLE_ROUTE, nextState.position);
-  nearestTrackDistance = nearest.distanceAlongTrack;
-  const safeHalfWidth = Math.max(3.1, nearest.width * 0.5 - 1.8);
-  const correctedPosition = nextState.position.clone();
-  const correctedVelocity = nextState.velocity.clone();
-
-  const towardCenter = new Vector3()
-    .subVectors(nearest.position, correctedPosition)
-    .setY(0);
-  const distance = towardCenter.length();
-  const outside = distance > safeHalfWidth;
-
-  if (outside && distance > 0.001) {
-    const correction = Math.min(distance - safeHalfWidth, 3.4) * Math.min(1, deltaSeconds * 7);
-    towardCenter.normalize();
-    correctedPosition.addScaledVector(towardCenter, correction);
-    const inwardSpeed = correctedVelocity.dot(towardCenter);
-    if (inwardSpeed < 0) correctedVelocity.addScaledVector(towardCenter, -inwardSpeed * 1.4);
-    if (wallSparkCooldown <= 0) {
-      effects?.emitSparks(correctedPosition, towardCenter, 5);
-      wallSparkCooldown = 0.16;
-    }
+function keepCarOnRoute(nextState: CarState): CarState {
+  const result = constrainCarToRoad(SAMPLE_ROUTE, nextState, CAR_ROAD_LIFT);
+  nearestTrackDistance = result.nearest.distanceAlongTrack;
+  if (result.contact && wallSparkCooldown <= 0) {
+    effects?.emitSparks(result.contact.position, result.contact.direction,
+      12 + Math.min(12, result.contact.impactSpeed * 2));
+    wallSparkCooldown = 0.045;
   }
-
-  correctedPosition.y = nearest.position.y + CAR_ROAD_LIFT;
-  return {
-    ...nextState,
-    position: correctedPosition,
-    velocity: correctedVelocity,
-    speed: correctedVelocity.length(),
-  };
+  return result.state;
 }
 
 function updateCamera(deltaSeconds: number): void {
   if (!camera || !car) return;
-  chaseCamera?.update(car.position, carState.heading, carState.speed, deltaSeconds);
+  if (status === 'countdown') {
+    const shotIndex = Math.min(
+      COUNTDOWN_CAMERA_SHOTS.length - 1,
+      Math.floor(countdownElapsedSeconds / COUNTDOWN_STEP_SECONDS),
+    );
+    chaseCamera?.updateCountdown(
+      car.position,
+      carState.heading,
+      COUNTDOWN_CAMERA_SHOTS[shotIndex],
+    );
+  } else {
+    chaseCamera?.update(car.position, carState.heading, carState.speed, deltaSeconds, { ...carState, airborne: cliffDive.active });
+  }
   world?.sky.position.copy(camera.position);
 }
 
@@ -484,7 +497,7 @@ function updateCarVisual(deltaSeconds: number): void {
   const carForward = new Vector3(Math.sin(carState.heading), 0, Math.cos(carState.heading));
   const roadPitch = Math.atan2(roadTangent.y, Math.hypot(roadTangent.x, roadTangent.z))
     * Math.sign(carForward.dot(roadTangent));
-  car?.update({ ...carState, roadPitch }, deltaSeconds);
+  car?.update({ ...carState, roadPitch: cliffDive.active ? cliffDive.pitch : roadPitch, airborne: cliffDive.active }, deltaSeconds);
 }
 
 function updateQuality(frameTimeMs: number): void {
@@ -504,24 +517,40 @@ function updateRace(deltaSeconds: number): void {
   }
 
   const previousPosition = carState.position.clone();
-  const nextState = updateCarState(
-    carState,
-    input.getArcadeInput(),
-    deltaSeconds,
-  );
-  carState = keepCarOnRoute(nextState, deltaSeconds);
+  const controls = input.getArcadeInput();
+  const steps = Math.max(1, Math.ceil(deltaSeconds * 120));
+  for (let step = 0; step < steps; step += 1) {
+    const stepDelta = deltaSeconds / steps;
+    if (!cliffDive.active) {
+      const next = updateCarState(carState, controls, stepDelta);
+      const distance = findNearestTrackPoint(SAMPLE_ROUTE, next.position).distanceAlongTrack;
+      if (!cliffDive.tryLaunch(next, distance)) {
+        carState = keepCarOnRoute(next);
+        continue;
+      }
+      carState = next;
+    }
+    const flight = cliffDive.step(carState, controls, stepDelta);
+    carState = flight.state;nearestTrackDistance = cliffDive.routeDistance;
+    if (flight.splash) { effects.emitSplash(flight.splash);audio.playSplash(); }
+    if (flight.landed) chaseCamera?.reset();
+  }
 
   elapsedSeconds += deltaSeconds;
   totalRaceTimeMs = elapsedSeconds * 1_000;
   const travelDistance = previousPosition.distanceTo(carState.position);
   raceDistanceMeters += travelDistance;
   const speedKmh = carState.speed * WORLD_SPEED_TO_KMH;
+  const signedSpeed = carState.velocity.x * Math.sin(carState.heading)
+    + carState.velocity.z * Math.cos(carState.heading);
+  const gearbox = transmission.update(signedSpeed, carState.throttle, deltaSeconds);
+  engineRpm = gearbox.rpm;
   maxSpeedKmh = Math.max(maxSpeedKmh, speedKmh);
   goDisplayRemaining = Math.max(0, goDisplayRemaining - deltaSeconds);
   wallSparkCooldown = Math.max(0, wallSparkCooldown - deltaSeconds);
 
   const nearest = findNearestTrackPoint(SAMPLE_ROUTE, carState.position);
-  const onTrack = nearest.distanceFromTrack <= nearest.width * 0.5 - 0.5;
+  const onTrack = cliffDive.active || nearest.distanceFromTrack <= nearest.width * 0.5 - 0.5;
   const completedLaps = routeProgress.update(nearestTrackDistance, travelDistance, onTrack);
   if (completedLaps >= currentLap) {
     const lapTimeMs = totalRaceTimeMs - lapStartedAtMs;
@@ -537,11 +566,13 @@ function updateRace(deltaSeconds: number): void {
   updateCarVisual(deltaSeconds);
   effects.update(deltaSeconds, carState, {
     wheelPositions: car.getWheelWorldPositions(wheelPositions),
+    emitDriftEffects: !cliffDive.active,
   });
   world.update(deltaSeconds, {
-    elapsedSeconds,
     routeDistance: nearestTrackDistance,
+    playerPosition: carState.position,
     speed: carState.speed,
+    submerged: cliffDive.active ? cliffDive.submerged : undefined,
   });
 
   hud.update({
@@ -551,6 +582,8 @@ function updateRace(deltaSeconds: number): void {
     raceTimeMs: totalRaceTimeMs,
     bestLapTimeMs,
     speedKmh,
+    gear: gearbox.gear,
+    rpm: gearbox.rpm,
     maxSpeedKmh,
     distanceMeters: raceDistanceMeters,
     racePhase: goDisplayRemaining > 0 ? 'go' : 'racing',
@@ -577,17 +610,18 @@ function updateCountdown(deltaSeconds: number): void {
 }
 
 function updateIdle(deltaSeconds: number): void {
+  effects?.update(deltaSeconds, undefined, { emitDriftEffects: false });
   world?.update(deltaSeconds, {
-    elapsedSeconds,
     routeDistance: nearestTrackDistance,
+    playerPosition: carState.position,
     speed: 0,
   });
   updateCarVisual(deltaSeconds);
 }
 
 function renderFrame(now: number): void {
-  const frameTimeMs = Math.min(100, Math.max(0, now - lastFrameAt));
-  const deltaSeconds = Math.min(0.05, frameTimeMs / 1_000);
+  const frameTimeMs = Math.min(250, Math.max(0, now - lastFrameAt));
+  const deltaSeconds = frameTimeMs / 1_000;
   lastFrameAt = now;
   if (document.hidden) {
     audio.update(0, 0, 0, false);
@@ -601,12 +635,12 @@ function renderFrame(now: number): void {
 
   updateCamera(deltaSeconds);
   updateQuality(frameTimeMs);
-  audio.update(carState.speed, carState.throttle, carState.drift, status === 'racing');
+  audio.update(carState.speed, carState.throttle, carState.drift, status === 'racing', engineRpm, !cliffDive.active, cliffDive.active && cliffDive.submerged);
   if (scene?.fog instanceof FogExp2) {
-    const underwater = sampleTrackSection(SAMPLE_ROUTE, nearestTrackDistance) === 'underwater';
+    const underwater = (cliffDive.active && cliffDive.submerged) || sampleTrackSection(SAMPLE_ROUTE, nearestTrackDistance) === 'underwater';
     const amount = 1 - Math.exp(-deltaSeconds * 3);
     scene.fog.color.lerp(underwater ? underwaterFogColor : coastFogColor, amount);
-    scene.fog.density += ((underwater ? 0.025 : 0.006) - scene.fog.density) * amount;
+    scene.fog.density += ((underwater ? 0.025 : 0.018) - scene.fog.density) * amount;
   }
   pipeline?.render();
   requestAnimationFrame(renderFrame);
@@ -666,7 +700,7 @@ function finishBoot(): void {
   requestAnimationFrame(renderFrame);
 }
 
-function boot(): void {
+async function boot(): Promise<void> {
   setLoadingProgress(18, 'Profiling your browser graphics path');
   const capabilities = probeCapabilities();
   quality = readQualityProfile() ?? recommendQualityTier(capabilities);
@@ -691,19 +725,29 @@ function boot(): void {
 
   scene = new Scene();
   scene.background = new Color(0x070312);
-  scene.fog = new FogExp2(coastFogColor, 0.006);
+  scene.environment = createPaintEnvironment(renderer).texture;
+  scene.environmentIntensity = 0.4;
+  scene.fog = new FogExp2(coastFogColor, 0.018);
   camera = new PerspectiveCamera(60, window.innerWidth / Math.max(1, window.innerHeight), 0.1, 1200);
   chaseCamera = new ChaseCamera(camera, SAMPLE_ROUTE);
   pipeline = new RenderPipeline(renderer, scene, camera);
   camera.up.set(0, 1, 0);
   camera.position.set(-7, 3.1, -3);
 
+  setLoadingProgress(48, 'Loading scenery textures');
+  try {
+    await preloadSceneryTextures();
+  } catch (error) {
+    showError('Scenery textures could not load. Reload to retry.');
+    console.error(error);
+    return;
+  }
   setLoadingProgress(58, 'Building the Rift Racer coastline');
   world = createWorldForQuality(quality);
   effects = createEffectsForQuality(quality);
   car = createCarForQuality(quality);
   scene.add(world, effects, car);
-  applyQualitySettings(scene, renderer, quality);
+  applyQualitySettings(renderer, quality);
 
   input = createKeyboardInput({ preventDefault: true, headlightsEnabled: false });
   governor = createGovernorForQuality(quality);

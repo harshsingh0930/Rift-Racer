@@ -1,0 +1,13 @@
+{
+  "mode": "built-in image_gen",
+  "assets": [
+    {
+      "path": "public/textures/coastal-facade.png",
+      "prompt": "Use case: stylized-concept. Asset type: seamless square diffuse texture for a 3D synthwave arcade racing game's building walls. Generate a polished 2048x2048 flat orthographic architectural facade texture, edge-to-edge covering the entire image, no perspective, no whole building silhouette, no sky, no ground or foreground. Purple charcoal concrete and dark navy metal mullions, a clean regular grid of eight columns by twelve floors of recessed glass windows. Some windows softly illuminated amber or pale cyan, most dark with subtle violet reflections. Fine convincing concrete grain, panel seams, metal trim and glass detail, clean hand-painted game art with crisp forms. Grounded stylized 1980s coastal architecture, readable at speed, restrained neon. Lighting must be baked softly and evenly without strong directional shadows, no glare, no large glowing panels. The left and right and top and bottom edges should tile continuously. No text, numbers, signage, logos, borders or watermark."
+    },
+    {
+      "path": "public/textures/reef-fish.png",
+      "prompt": "Use case: stylized-concept. Asset type: transparent PNG fish sprite for a 3D underwater glass tunnel in a synthwave arcade racer. One elegant tropical reef fish in exact broadside profile facing right, entire fish including tail and fins visible with generous transparent margin, centered on fully transparent background. Fish body elongated oval, teal blue scales, pale silver belly, subtle violet top and golden fin edges, visible small dark eye and gill, graceful translucent dorsal and tail fins. Crisp polished hand-painted game texture with fine scale and fin detail, gentle volume shading, graphic readable silhouette, subtly stylized rather than photorealistic or cartoon emoji. Fish approximately twice as wide as tall. No environment, water, bubbles, ground shadow, text, labels, frame or watermark. Only a single fish, true transparent alpha background."
+    }
+  ]
+}

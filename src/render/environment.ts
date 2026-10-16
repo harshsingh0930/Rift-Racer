@@ -1,11 +1,44 @@
 import {
-  AdditiveBlending, BackSide, BufferGeometry, Color, DoubleSide,
-  Float32BufferAttribute, Group, Mesh, MeshBasicMaterial, MeshStandardMaterial,
+  AdditiveBlending, BoxGeometry, BufferGeometry, Color, DoubleSide,
+  Float32BufferAttribute, Group, InstancedMesh, Matrix4, Mesh, MeshStandardMaterial,
   PlaneGeometry, ShaderMaterial, SphereGeometry, Vector3,
 } from "three";
 import { sampleTrackPosition, sampleTrackSection, sampleTrackTangent, sampleTrackWidth, type TrackRoute } from "../game/track";
 
 const UP = new Vector3(0, 1, 0);
+
+function makeBridgePiers(route: TrackRoute): InstancedMesh {
+  const transforms: Matrix4[] = [];
+  for (let distance = 12; distance < route.totalLength; distance += 36) {
+    const section = sampleTrackSection(route, distance);
+    if (section !== "causeway" && section !== "final-skyline") continue;
+    const center = sampleTrackPosition(route, distance);
+    if (center.y < 1) continue;
+    const side = new Vector3().crossVectors(UP, sampleTrackTangent(route, distance)).normalize();
+    for (const sign of [-1, 1]) {
+      const position = center.clone().addScaledVector(side, sign * (sampleTrackWidth(route, distance) * 0.5 - 0.4));
+      // A flyover support must not occupy the road beneath it.
+      const obstructsRoad = route.points.some((point, index) => {
+        const gap = Math.abs(route.segments[index].startDistance - distance);
+        if (Math.min(gap, route.totalLength - gap) < 30) return false;
+        return point.position.y > -5 && point.position.y < center.y
+          && Math.hypot(point.position.x - position.x, point.position.z - position.z) < point.width * 0.5 + 1.5;
+      });
+      if (obstructsRoad) continue;
+      const height = center.y + 5;
+      const matrix = new Matrix4().makeScale(0.9, height, 0.9);
+      matrix.setPosition(position.x, -5 + height * 0.5 - 0.12, position.z);
+      transforms.push(matrix);
+    }
+  }
+  const piers = new InstancedMesh(new BoxGeometry(1, 1, 1), new MeshStandardMaterial({
+    color: 0x28243b, roughness: 0.9,
+  }), transforms.length);
+  piers.name = "rift-bridge-supports";
+  transforms.forEach((matrix, index) => piers.setMatrixAt(index, matrix));
+  piers.computeBoundingSphere();
+  return piers;
+}
 
 /** Ground follows the same route as the asphalt, with cliffs down to sea level. */
 function makeCoastBanks(route: TrackRoute): Mesh<BufferGeometry, MeshStandardMaterial> {
@@ -17,7 +50,9 @@ function makeCoastBanks(route: TrackRoute): Mesh<BufferGeometry, MeshStandardMat
   let vertex = 0;
   for (let index = 0; index < route.segments.length; index += 1) {
     const segment = route.segments[index];
-    if (segment.section === "underwater") continue;
+    // Bridges and skyline flyovers need open space underneath. Wide banks
+    // along those spans used to cut through the lower road at crossings.
+    if (segment.section !== "coastal-boulevard") continue;
     const ends = [segment.start, segment.end];
     for (let endIndex = 0; endIndex < 2; endIndex += 1) {
       const point = ends[endIndex];
@@ -79,7 +114,13 @@ export function createSynthwaveSun(): Group {
     name: "rift-sunset-halo-material", transparent: true, depthWrite: false,
     blending: AdditiveBlending,
     vertexShader: `varying vec2 vUv; void main(){vUv=uv;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`,
-    fragmentShader: `varying vec2 vUv; void main(){float r=length(vUv-0.5)*2.0;float a=pow(max(0.0,1.0-r),3.0)*0.4;gl_FragColor=vec4(1.0,0.21,0.11,a); #include <colorspace_fragment> }`.replace(" #include", "\n#include"),
+    fragmentShader: `varying vec2 vUv;
+      void main(){
+        float r=length(vUv-0.5)*2.0;
+        float a=pow(max(0.0,1.0-r),3.0)*0.4;
+        gl_FragColor=vec4(1.0,0.21,0.11,a);
+        #include <colorspace_fragment>
+      }`,
     side: DoubleSide,
   });
   const halo = new Mesh(new PlaneGeometry(150, 150), glowMaterial);
@@ -92,24 +133,57 @@ export function createSynthwaveSun(): Group {
 export function createCoastalEnvironment(route: TrackRoute): Group {
   const environment = new Group();
   environment.name = "rift-coastal-environment";
-  environment.add(makeCoastBanks(route));
+  environment.add(makeCoastBanks(route), makeBridgePiers(route));
+  // Cut the sea surface around the glass enclosure itself, including the
+  // descent ahead of the player. A player-centred hole hid the ramp at entry.
+  const openings: Vector3[] = [];
+  for (let distance = 0; distance < route.totalLength; distance += 6) {
+    if (sampleTrackSection(route, distance) !== "underwater") continue;
+    const center = sampleTrackPosition(route, distance);
+    const radius = sampleTrackWidth(route, distance) / 2 + 1.7;
+    const height = Math.abs(center.y + 1.8);
+    if (height < radius && openings.length < 64) {
+      openings.push(new Vector3(center.x, center.z, Math.sqrt(radius * radius - height * height) + 1));
+    }
+  }
+  const openingCount = openings.length;
+  while (openings.length < 64) openings.push(new Vector3());
   const waterMaterial = new ShaderMaterial({
     name: "rift-ocean-material", side: DoubleSide,
-    uniforms: { time: { value: 0 } },
+    uniforms: { time: { value: 0 }, playerPosition: { value: new Vector3(0, 1, 0) },
+      openings: { value: openings }, openingCount: { value: openingCount }, hazeColor: { value: new Color(0x57354f) } },
     vertexShader: `varying vec3 vWorld; void main(){vec4 world=modelMatrix*vec4(position,1.0);vWorld=world.xyz;gl_Position=projectionMatrix*viewMatrix*world;}`,
-    fragmentShader: `uniform float time; varying vec3 vWorld;
+    fragmentShader: `uniform float time; uniform vec3 playerPosition; uniform vec3 hazeColor;
+      uniform vec3 openings[64]; uniform int openingCount; varying vec3 vWorld;
+      float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
+      float noise(vec2 p){
+        vec2 i=floor(p),f=fract(p);f=f*f*(3.0-2.0*f);
+        return mix(mix(hash(i),hash(i+vec2(1.0,0.0)),f.x),mix(hash(i+vec2(0.0,1.0)),hash(i+vec2(1.0)),f.x),f.y);
+      }
+      float heightAt(vec2 p){
+        return noise(p*0.16+vec2(time*0.08,time*0.035))*0.065
+          +noise(p*0.57+vec2(-time*0.06,time*0.1))*0.016;
+      }
       void main(){
+        for(int i=0;i<64;i++){
+          if(i>=openingCount) break;
+          vec2 openingGap=vWorld.xz-openings[i].xy;
+          if(dot(openingGap,openingGap)<openings[i].z*openings[i].z) discard;
+        }
         vec3 view=normalize(cameraPosition-vWorld);
         float distanceToCamera=length(cameraPosition.xz-vWorld.xz);
-        float ripple=sin(vWorld.x*0.48+time*0.9+sin(vWorld.z*0.36-time*0.4))*sin(vWorld.z*0.7-time*0.8);
-        float fresnel=pow(1.0-abs(view.y),3.0);
-        vec3 water=mix(vec3(0.016,0.075,0.13),vec3(0.12,0.09,0.21),fresnel);
-        float reflection=exp(-pow((vWorld.z-9.0)/(6.0+abs(vWorld.x)*0.07),2.0));
-        float glint=pow(max(0.0,ripple),7.0)*reflection;
-        water+=vec3(0.47,0.12,0.25)*glint*0.7;
-        water+=vec3(0.012,0.04,0.055)*ripple;
-        water=mix(water,vec3(0.15,0.08,0.19),smoothstep(100.0,650.0,distanceToCamera));
-        if(cameraPosition.y < -1.8) water=mix(water,vec3(0.025,0.24,0.31),0.7);
+        float height=heightAt(vWorld.xz);
+        float detail=1.0-smoothstep(45.0,150.0,distanceToCamera);
+        vec3 normal=normalize(vec3((height-heightAt(vWorld.xz+vec2(0.6,0.0)))*detail,0.6,(height-heightAt(vWorld.xz+vec2(0.0,0.6)))*detail));
+        float fresnel=pow(1.0-max(0.0,dot(view,normal)),4.0);
+        vec3 water=mix(vec3(0.006,0.019,0.035),vec3(0.15,0.065,0.14),fresnel*0.7);
+        vec3 sunDirection=normalize(vec3(230.0,35.0,9.0));
+        float glint=pow(max(0.0,dot(reflect(-sunDirection,normal),view)),190.0);
+        water+=vec3(0.55,0.25,0.19)*glint*0.45;
+        water+=vec3(0.004,0.008,0.009)*(height-0.04);
+        vec3 haze=hazeColor;
+        if(cameraPosition.y < -1.8){water=vec3(0.009,0.10,0.15)+water*0.2;haze=vec3(0.002,0.038,0.06);}
+        water=mix(water,haze,1.0-exp(-0.000324*distanceToCamera*distanceToCamera));
         gl_FragColor=vec4(water,1.0);
         #include <tonemapping_fragment>
         #include <colorspace_fragment>
@@ -120,13 +194,21 @@ export function createCoastalEnvironment(route: TrackRoute): Group {
   ocean.rotation.x = -Math.PI / 2;
   ocean.position.y = -1.8;
   environment.add(ocean);
+  const seabed = new Mesh(new PlaneGeometry(1600, 1600), new MeshStandardMaterial({
+    name: "rift-seabed-material", color: 0x16404b, emissive: 0x05212b,
+    emissiveIntensity: 0.45, roughness: 1,
+  }));
+  seabed.name = "rift-seabed";
+  seabed.rotation.x = -Math.PI / 2;
+  seabed.position.y = -40;
+  environment.add(seabed);
 
   // Distant rock silhouettes give the horizon depth without external assets.
   const rockGeometry = new SphereGeometry(1, 7, 5);
   const rockMaterial = new MeshStandardMaterial({ color: 0x34213f, roughness: 1, flatShading: true });
   for (let index = 0; index < 13; index += 1) {
     const rock = new Mesh(rockGeometry, rockMaterial);
-    rock.position.set(-160 + index * 33, -1, -164 - Math.sin(index * 1.7) * 18);
+    rock.position.set(-350 + index * 60, -1, -430 - Math.sin(index * 1.7) * 18);
     rock.scale.set(20 + (index % 3) * 8, 15 + (index % 4) * 9, 20);
     environment.add(rock);
   }

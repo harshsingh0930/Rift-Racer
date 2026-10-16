@@ -3,6 +3,7 @@ import {
   saveBestTime,
 } from '../game/storage';
 import type { StorageLike } from '../game/storage';
+import type { AutomaticGear } from '../game/transmission';
 
 export const HUD_BEST_TIMES_STORAGE_KEY = 'rift-racer.best-times';
 export const DEFAULT_MAX_BEST_TIMES = 5;
@@ -51,6 +52,8 @@ export interface RaceHudState {
   readonly bestLapTimeMs: number | null;
   readonly speedKmh: number;
   readonly maxSpeedKmh: number;
+  readonly gear: AutomaticGear;
+  readonly rpm: number;
   readonly distanceKm: number;
   readonly soundEnabled: boolean;
   readonly headlightsEnabled: boolean;
@@ -69,6 +72,8 @@ export interface RaceHudUpdate {
   bestLapTimeMs?: number | null;
   speedKmh?: number;
   maxSpeedKmh?: number;
+  gear?: AutomaticGear;
+  rpm?: number;
   /** Convenience input when the game model tracks world units/metres. */
   distanceMeters?: number;
   distanceKm?: number;
@@ -109,6 +114,8 @@ const DEFAULT_STATE: RaceHudState = {
   bestLapTimeMs: null,
   speedKmh: 0,
   maxSpeedKmh: 0,
+  gear: 1,
+  rpm: 950,
   distanceKm: 0,
   soundEnabled: true,
   headlightsEnabled: false,
@@ -345,6 +352,8 @@ function normalizeState(
         : finiteNonNegative(state.bestLapTimeMs, DEFAULT_STATE.bestLapTimeMs ?? 0),
     speedKmh: finiteNonNegative(state.speedKmh, DEFAULT_STATE.speedKmh),
     maxSpeedKmh: finiteNonNegative(state.maxSpeedKmh, DEFAULT_STATE.maxSpeedKmh),
+    gear: state.gear === 'R' ? 'R' : Math.min(6, positiveInteger(state.gear, 1)) as AutomaticGear,
+    rpm: Math.min(9_000, finiteNonNegative(state.rpm, DEFAULT_STATE.rpm)),
     distanceKm: finiteNonNegative(state.distanceKm, DEFAULT_STATE.distanceKm),
     soundEnabled: state.soundEnabled === undefined ? DEFAULT_STATE.soundEnabled : Boolean(state.soundEnabled),
     headlightsEnabled: state.headlightsEnabled === undefined
@@ -433,23 +442,23 @@ function createHudElement(): HTMLElement {
       </section>
     </div>
 
-    <section class="vrr-hud__speed-panel" aria-label="Speed and distance">
-      <div class="vrr-hud__speed-heading">
-        <span>VELOCITY</span>
-        <span data-hud="peak">PEAK 0 KM/H</span>
-      </div>
-      <svg class="vrr-hud__speedometer" viewBox="0 0 320 176" role="img" aria-label="Neon speedometer">
-        <path class="vrr-hud__speed-track" d="M 32 144 A 128 128 0 0 1 288 144" pathLength="402.124" />
-        <path class="vrr-hud__speed-track-inner" d="M 44 144 A 116 116 0 0 1 276 144" pathLength="364.424" />
-        <path class="vrr-hud__speed-arc" data-hud="speed-arc" d="M 32 144 A 128 128 0 0 1 288 144" pathLength="402.124" />
+    <section class="vrr-hud__speed-panel" aria-label="Automatic transmission, engine speed and road speed">
+      <svg class="vrr-hud__speedometer" viewBox="0 0 320 320" role="img" aria-label="Tachometer, revolutions per minute">
+        <path class="vrr-hud__speed-track" d="M 61 259 A 140 140 0 1 1 300 160" />
+        <path class="vrr-hud__redline" d="M 252 54 A 140 140 0 0 1 300 160" />
         <g class="vrr-hud__speed-ticks" data-hud="speed-ticks" aria-hidden="true"></g>
+        <text x="160" y="92" class="vrr-hud__rpm-label" text-anchor="middle">RPM × 1000</text>
+        <g data-hud="rpm-needle" class="vrr-hud__rpm-needle">
+          <path d="M 158 166 L 160 29 L 163 166 Z" />
+        </g>
+        <circle class="vrr-hud__gear-ring" cx="160" cy="160" r="33" />
       </svg>
+      <div class="vrr-hud__gear"><output data-hud="gear" aria-label="Automatic gear">1</output><span>AUTO</span></div>
       <div class="vrr-hud__speed-readout">
-        <output class="vrr-hud__speed-value" data-hud="speed" aria-live="polite">0</output>
         <span class="vrr-hud__speed-unit">KM/H</span>
+        <output class="vrr-hud__speed-value" data-hud="speed" aria-live="polite">0</output>
       </div>
-      <div class="vrr-hud__distance"><span>DISTANCE</span><strong data-hud="distance">0.00 KM</strong></div>
-      <div class="vrr-hud__speed-caption"><span class="vrr-hud__pulse"></span> RIFT VELOCITY</div>
+      <div class="vrr-hud__distance"><strong data-hud="distance">0.00 KM</strong><span data-hud="peak">PEAK 0 KM/H</span></div>
     </section>
 
     <aside class="vrr-hud__best-times" aria-label="Local best times">
@@ -488,17 +497,28 @@ function createHudElement(): HTMLElement {
   const ticks = element.querySelector<SVGGElement>('[data-hud="speed-ticks"]');
   if (ticks) {
     const centerX = 160;
-    const centerY = 144;
-    for (let index = 0; index <= 12; index += 1) {
-      const angle = Math.PI - (Math.PI * index) / 12;
-      const outerRadius = index % 3 === 0 ? 124 : 119;
-      const innerRadius = index % 3 === 0 ? 112 : 114;
+    const centerY = 160;
+    for (let index = 0; index <= 45; index += 1) {
+      const angle = (135 + index * 5) * Math.PI / 180;
+      const major = index % 5 === 0;
+      const outerRadius = 139;
+      const innerRadius = major ? 128 : 134;
       const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
       line.setAttribute('x1', String(centerX + Math.cos(angle) * innerRadius));
-      line.setAttribute('y1', String(centerY - Math.sin(angle) * innerRadius));
+      line.setAttribute('y1', String(centerY + Math.sin(angle) * innerRadius));
       line.setAttribute('x2', String(centerX + Math.cos(angle) * outerRadius));
-      line.setAttribute('y2', String(centerY - Math.sin(angle) * outerRadius));
+      line.setAttribute('y2', String(centerY + Math.sin(angle) * outerRadius));
+      if (index >= 38) line.classList.add('vrr-hud__red-tick');
       ticks.appendChild(line);
+      if (major) {
+        const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        text.setAttribute('x', String(centerX + Math.cos(angle) * 116));
+        text.setAttribute('y', String(centerY + Math.sin(angle) * 116 + 4));
+        text.setAttribute('text-anchor', 'middle');
+        if (index >= 40) text.classList.add('vrr-hud__red-tick');
+        text.textContent = String(index / 5);
+        ticks.appendChild(text);
+      }
     }
   }
 
@@ -744,6 +764,10 @@ export class RaceHud {
     setText(root, '[data-hud="speed"]', String(speed));
     setText(root, '[data-hud="distance"]', formatDistance(state.distanceKm));
     setText(root, '[data-hud="peak"]', `PEAK ${Math.round(state.maxSpeedKmh)} KM/H`);
+    setText(root, '[data-hud="gear"]', String(state.gear));
+    const needle = root.querySelector<SVGGElement>('[data-hud="rpm-needle"]');
+    needle?.setAttribute('transform', `rotate(${-135 + state.rpm / 9_000 * 225} 160 160)`);
+    root.dataset.redline = String(state.rpm > 7_600);
     const arc = root.querySelector<SVGPathElement>('[data-hud="speed-arc"]');
     if (arc) {
       arc.style.strokeDasharray = `${SPEEDOMETER_ARC_LENGTH} ${SPEEDOMETER_ARC_LENGTH}`;

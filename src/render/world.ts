@@ -4,6 +4,7 @@ import {
   BoxGeometry,
   BufferAttribute,
   BufferGeometry,
+  Float32BufferAttribute,
   Color,
   ConeGeometry,
   CylinderGeometry,
@@ -16,18 +17,24 @@ import {
   Matrix4,
   Mesh,
   MeshBasicMaterial,
+  MeshPhysicalMaterial,
   MeshStandardMaterial,
   Object3D,
   PlaneGeometry,
   PointLight,
   Quaternion,
+  Raycaster,
   ShaderMaterial,
   SphereGeometry,
+  Sprite,
+  SpriteMaterial,
   TorusGeometry,
+  Texture,
   Vector3,
 } from "three";
 import {
   SAMPLE_ROUTE,
+  findNearestTrackPoint,
   sampleTrackPosition,
   sampleTrackSection,
   sampleTrackTangent,
@@ -38,6 +45,12 @@ import {
 } from "../game/track";
 import type { QualityTier } from "../game/performance";
 import { createCoastalEnvironment, createSynthwaveSun } from "./environment";
+import { createAsphaltMaterial } from "./surfaces";
+import { createUnderwaterStructure } from "./underwater";
+import { createRoadsideDistrict } from "./district";
+import { LocalSceneVisibility } from "./visibility";
+import { CliffDiveTransition, createStartGate, getDiveLayout } from "./landmarks";
+import { detailTexture, sceneryTexture } from "./texture-assets";
 
 const UP = new Vector3(0, 1, 0);
 const FORWARD = new Vector3(0, 0, 1);
@@ -64,19 +77,39 @@ export interface RiftWorldUpdateState {
   routeDistance?: number;
   /** Current player speed, used only for a small neon pulse boost. */
   speed?: number;
+  playerPosition?: Readonly<{ x: number; y: number; z: number }>;
+  submerged?: boolean;
 }
-
-type AnimatedBubble = {
-  object: Object3D;
-  baseY: number;
-  phase: number;
-  amplitude: number;
-};
 
 type DynamicLightData = {
   light: PointLight;
   baseIntensity: number;
   phase: number;
+};
+
+type DecorativeCullItem = {
+  object: Object3D;
+  routeDistance: number;
+  halfSpan: number;
+};
+
+type AirborneCue = {
+  mesh: InstancedMesh;
+  index: number;
+  basePosition: Vector3;
+  scale: Vector3;
+  rotation: Quaternion;
+  phase: number;
+};
+
+type TrackGroupData = {
+  group: Group;
+  decorative: DecorativeCullItem[];
+};
+
+type SceneryData = {
+  group: Group;
+  airborne: AirborneCue[];
 };
 
 type OwnedMaterial = MeshBasicMaterial | MeshStandardMaterial | ShaderMaterial;
@@ -87,12 +120,6 @@ function clamp(value: number, minimum: number, maximum: number): number {
 
 function finiteOr(value: number | undefined, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-function sectionColor(section: TrackSection): number {
-  if (section === "tunnel") return 0x3b164e;
-  if (section === "underwater") return 0x06395f;
-  return 0x090719;
 }
 
 function makeSideVector(tangent: Vector3, target = new Vector3()): Vector3 {
@@ -165,6 +192,38 @@ function segmentPointIndices(route: TrackRoute, segmentIndex: number): [number, 
   return [startIndex, endIndex];
 }
 
+/**
+ * Return the shortest horizontal distance from a world-space point to a route
+ * segment. Scenery is visual-only, but it should still be kept away from the
+ * complete road span rather than just from the authored control points. The
+ * sample route is densely sampled; custom routes are not necessarily so this
+ * segment test is deliberately conservative.
+ */
+function horizontalDistanceToSegment(
+  position: Vector3,
+  segment: Pick<TrackSegment, "start" | "end">,
+): number {
+  const start = segment.start.position;
+  const end = segment.end.position;
+  const dx = end.x - start.x;
+  const dz = end.z - start.z;
+  const lengthSquared = dx * dx + dz * dz;
+  const amount = lengthSquared <= EPSILON
+    ? 0
+    : clamp(((position.x - start.x) * dx + (position.z - start.z) * dz) / lengthSquared, 0, 1);
+  const closestX = start.x + dx * amount;
+  const closestZ = start.z + dz * amount;
+  return Math.hypot(position.x - closestX, position.z - closestZ);
+}
+
+function isClearOfRoad(route: TrackRoute, position: Vector3, radius: number): boolean {
+  const safeRadius = Math.max(0, finiteOr(radius, 0));
+  return route.segments.every((segment) => {
+    const roadHalfWidth = Math.max(segment.start.width, segment.end.width) * 0.5;
+    return horizontalDistanceToSegment(position, segment) > roadHalfWidth + safeRadius;
+  });
+}
+
 function makeGradientSky(): Mesh<SphereGeometry, ShaderMaterial> {
   const geometry = new SphereGeometry(380, 16, 10);
   const material = new ShaderMaterial({
@@ -198,6 +257,8 @@ function makeGradientSky(): Mesh<SphereGeometry, ShaderMaterial> {
         // every distant surface into the same hot-pink value.
         float haze = 1.0 - smoothstep(0.02, 0.16, abs(height - 0.01));
         sky = mix(sky, vec3(0.16, 0.15, 0.30), haze * 0.13);
+        float sunset=step(topColor.g,topColor.r)*exp(-pow((height+0.008)/0.045,2.0));
+        sky=mix(sky,vec3(0.95,0.32,0.11),sunset*0.65);
         gl_FragColor = vec4(sky, 1.0);
         #include <tonemapping_fragment>
         #include <colorspace_fragment>
@@ -210,57 +271,15 @@ function makeGradientSky(): Mesh<SphereGeometry, ShaderMaterial> {
   return mesh;
 }
 
-function makeSunGlow(): Group {
-  const group = new Group();
-  group.name = "rift-synthwave-sun";
-
-  const glow = new Mesh(
-    new SphereGeometry(12, 12, 6),
-    new MeshBasicMaterial({
-      color: 0xff9b78,
-      transparent: true,
-      opacity: 0.1,
-      depthWrite: false,
-      blending: AdditiveBlending,
-    }),
-  );
-  glow.position.set(104, 30, 20);
-  group.add(glow);
-
-  const disc = new Mesh(
-    new SphereGeometry(6.2, 12, 6),
-    new MeshBasicMaterial({ color: 0xffc984, transparent: true, opacity: 0.86 }),
-  );
-  disc.position.copy(glow.position);
-  group.add(disc);
-  return group;
-}
-
-function makeCoastalWater(): Mesh<PlaneGeometry, MeshBasicMaterial> {
-  const water = new Mesh(
-    new PlaneGeometry(160, 82),
-    new MeshBasicMaterial({
-      name: "rift-coastal-water",
-      color: 0x0a345b,
-      transparent: true,
-      opacity: 0.72,
-      depthWrite: false,
-    }),
-  );
-  water.name = "rift-coastal-water-surface";
-  water.rotation.x = -Math.PI * 0.5;
-  water.position.set(36, -0.42, 17);
-  return water;
-}
-
 function makeRoadGeometry(route: TrackRoute, roadLift: number): BufferGeometry {
   const positions: number[] = [];
+  const uvs: number[] = [];
   const indices: number[] = [];
   const frames = makeRouteFrames(route);
   let vertex = 0;
 
   for (const segment of route.segments) {
-    if (segment.length <= EPSILON) continue;
+    if (segment.length <= EPSILON || segment.section === "cliff-dive") continue;
     const [startIndex, endIndex] = segmentPointIndices(route, segment.index);
     const startFrame = frames[startIndex] ?? { side: new Vector3(1, 0, 0), miterScale: 1 };
     const endFrame = frames[endIndex] ?? startFrame;
@@ -299,12 +318,22 @@ function makeRoadGeometry(route: TrackRoute, roadLift: number): BufferGeometry {
       endRight.y,
       endRight.z,
     );
-    indices.push(vertex, vertex + 1, vertex + 2, vertex + 1, vertex + 3, vertex + 2);
+    uvs.push(0, segment.startDistance * 0.15, 1, segment.startDistance * 0.15,
+      0, segment.endDistance * 0.15, 1, segment.endDistance * 0.15);
+    const roadTriangle = (a: Vector3, b: Vector3, c: Vector3, ia: number, ib: number, ic: number): number[] => {
+      const normal = new Vector3().subVectors(b, a).cross(new Vector3().subVectors(c, a));
+      return normal.y >= 0 ? [ia, ib, ic] : [ia, ic, ib];
+    };
+    indices.push(
+      ...roadTriangle(startLeft, startRight, endLeft, vertex, vertex + 1, vertex + 2),
+      ...roadTriangle(startRight, endRight, endLeft, vertex + 1, vertex + 3, vertex + 2),
+    );
     vertex += 4;
   }
 
   const geometry = new BufferGeometry();
   geometry.setAttribute("position", new BufferAttribute(new Float32Array(positions), 3));
+  geometry.setAttribute("uv", new BufferAttribute(new Float32Array(uvs), 2));
   geometry.setIndex(indices);
   geometry.computeVertexNormals();
   geometry.computeBoundingSphere();
@@ -316,14 +345,18 @@ function makeRibbonGeometry(
   sideSign: 1 | -1,
   roadLift: number,
   ribbonWidth: number,
+  startDistance = 0,
+  endDistance = Number.POSITIVE_INFINITY,
 ): BufferGeometry {
   const positions: number[] = [];
+  const colors: number[] = [];
   const indices: number[] = [];
   const frames = makeRouteFrames(route);
   let vertex = 0;
 
   for (const segment of route.segments) {
-    if (segment.length <= EPSILON) continue;
+    if (segment.length <= EPSILON || segment.section === "cliff-dive") continue;
+    if (segment.endDistance < startDistance || segment.startDistance > endDistance) continue;
     const [startIndex, endIndex] = segmentPointIndices(route, segment.index);
     const startFrame = frames[startIndex] ?? { side: new Vector3(1, 0, 0), miterScale: 1 };
     const endFrame = frames[endIndex] ?? startFrame;
@@ -360,29 +393,55 @@ function makeRibbonGeometry(
       endOuter.y,
       endOuter.z,
     );
+    const color = new Color(segment.section === "underwater" ? 0x45ffd0 : 0xff7439);
+    for (let index = 0; index < 4; index++) colors.push(color.r, color.g, color.b);
     indices.push(vertex, vertex + 1, vertex + 2, vertex + 1, vertex + 3, vertex + 2);
     vertex += 4;
   }
 
   const geometry = new BufferGeometry();
   geometry.setAttribute("position", new BufferAttribute(new Float32Array(positions), 3));
+  geometry.setAttribute("color", new Float32BufferAttribute(colors, 3));
   geometry.setIndex(indices);
   geometry.computeVertexNormals();
   geometry.computeBoundingSphere();
   return geometry;
 }
 
+/** Solid rail beam beneath the warm emissive strip. */
+function makeGuardrailGeometry(route: TrackRoute, side: 1 | -1, lift: number, start: number, end: number): BufferGeometry {
+  const ribbon = makeRibbonGeometry(route, side, lift + 0.42, 0.16, start, end);
+  const source = ribbon.getAttribute("position");const vertices: number[] = [];const indices: number[] = [];
+  for (let offset = 0; offset < source.count; offset += 4) {
+    const base = vertices.length / 3;
+    for (const lower of [false, true]) for (let vertex = 0; vertex < 4; vertex++) {
+      vertices.push(source.getX(offset + vertex), source.getY(offset + vertex) - (lower ? 0.17 : 0.01), source.getZ(offset + vertex));
+    }
+    indices.push(base, base + 2, base + 1, base + 1, base + 2, base + 3,
+      base, base + 4, base + 2, base + 2, base + 4, base + 6,
+      base + 1, base + 3, base + 5, base + 3, base + 7, base + 5);
+  }
+  ribbon.dispose();const geometry = new BufferGeometry();
+  geometry.setAttribute("position", new Float32BufferAttribute(vertices, 3));geometry.setIndex(indices);
+  geometry.computeVertexNormals();geometry.computeBoundingSphere();return geometry;
+}
+
 function makeShoulderGeometry(route: TrackRoute, roadLift: number, sideSign: 1 | -1): BufferGeometry {
   const positions: number[] = [];
   const indices: number[] = [];
-  const frames = makeRouteFrames(route);
   let vertex = 0;
 
   for (const segment of route.segments) {
-    if (segment.length <= EPSILON) continue;
-    const [startIndex, endIndex] = segmentPointIndices(route, segment.index);
-    const startFrame = frames[startIndex] ?? { side: new Vector3(1, 0, 0), miterScale: 1 };
-    const endFrame = frames[endIndex] ?? startFrame;
+    if (segment.length <= EPSILON || segment.section === "cliff-dive") continue;
+    // Each curb span uses its own tangent frame. Reusing the route miter at a
+    // sharp bend can twist the top quad through itself and create a dark,
+    // inverted triangle at the seam.
+    const segmentFrame = {
+      side: makeSideVector(segmentTangent(segment)),
+      miterScale: 1,
+    };
+    const startFrame = segmentFrame;
+    const endFrame = segmentFrame;
     const start = segment.start.position.clone().addScaledVector(UP, roadLift + 0.025);
     const end = segment.end.position.clone().addScaledVector(UP, roadLift + 0.025);
     const startInner = start.clone().addScaledVector(
@@ -459,9 +518,14 @@ function makeShoulderGeometry(route: TrackRoute, roadLift: number, sideSign: 1 |
     // Top cap, outer fascia, inner fascia, and a recessed underside. The
     // fascia is what makes the road edge read as a grounded curb instead of a
     // floating flat strip at bends and on the sloped route sections.
-    const topFace = sideSign === -1
-      ? [vertex, vertex + 1, vertex + 2, vertex + 1, vertex + 3, vertex + 2]
-      : [vertex, vertex + 2, vertex + 1, vertex + 1, vertex + 2, vertex + 3];
+    const topTriangle = (a: Vector3, b: Vector3, c: Vector3, ia: number, ib: number, ic: number): number[] => {
+      const normal = new Vector3().subVectors(b, a).cross(new Vector3().subVectors(c, a));
+      return normal.y >= 0 ? [ia, ib, ic] : [ia, ic, ib];
+    };
+    const topFace = [
+      ...topTriangle(startInner, endInner, startOuter, vertex, vertex + 2, vertex + 1),
+      ...topTriangle(startOuter, endInner, endOuter, vertex + 1, vertex + 2, vertex + 3),
+    ];
     const outerFace = sideSign === 1
       ? [vertex + 1, vertex + 3, vertex + 5, vertex + 5, vertex + 3, vertex + 7]
       : [vertex + 1, vertex + 5, vertex + 3, vertex + 5, vertex + 7, vertex + 3];
@@ -527,21 +591,20 @@ function makeTrackGroup(
   route: TrackRoute,
   roadLift: number,
   neonMaterials: MeshBasicMaterial[],
-): Group {
+  quality: QualityTier,
+): TrackGroupData {
   const group = new Group();
   group.name = "rift-track";
-  if (!route.closed) group.add(makeStartApproach(route, roadLift));
+  const decorative: DecorativeCullItem[] = [];
+  if (!route.closed) {
+    const approach = makeStartApproach(route, roadLift);
+    group.add(approach);
+    decorative.push({ object: approach, routeDistance: 0, halfSpan: 10 });
+  }
 
   const road = new Mesh(
     makeRoadGeometry(route, roadLift),
-    new MeshStandardMaterial({
-      name: "rift-asphalt",
-      color: 0x25283e,
-      emissive: 0x080b18,
-      emissiveIntensity: 0.35,
-      roughness: 0.6,
-      metalness: 0.16,
-    }),
+    createAsphaltMaterial(quality),
   );
   road.name = "rift-dark-road";
   road.receiveShadow = true;
@@ -566,7 +629,8 @@ function makeTrackGroup(
 
   const edgeMaterial = new MeshBasicMaterial({
     name: "rift-hot-pink-edge",
-    color: 0xe24d9d,
+    color: new Color(0xffffff).multiplyScalar(2.6),
+    vertexColors: true,
     transparent: true,
     opacity: 0.64,
     depthWrite: false,
@@ -575,15 +639,76 @@ function makeTrackGroup(
   });
   neonMaterials.push(edgeMaterial);
 
+  // Decorative road geometry is chunked so an active run only pays for the
+  // nearby route. The road and shoulders stay whole; these are purely visual.
+  const chunkLength = quality === "eco" ? 144 : quality === "ultra" ? 176 : 160;
+  const railMaterial = new MeshStandardMaterial({ name: "rift-solid-guardrail-material", color: 0x343047,
+    metalness: 0.45, roughness: 0.55, side: DoubleSide });
   for (const sideSign of [1, -1] as const) {
-    const ribbon = new Mesh(
-      makeRibbonGeometry(route, sideSign, roadLift, 0.12),
-      edgeMaterial,
-    );
-    ribbon.name = sideSign === 1 ? "rift-neon-ribbon-right" : "rift-neon-ribbon-left";
-    ribbon.renderOrder = 2;
-    group.add(ribbon);
+    const ribbonParent = new Group();
+    ribbonParent.name = sideSign === 1 ? "rift-neon-ribbon-right" : "rift-neon-ribbon-left";
+    const railParent = new Group();
+    railParent.name = sideSign === 1 ? "rift-raised-rail-right" : "rift-raised-rail-left";
+    for (let startDistance = 0; startDistance < route.totalLength; startDistance += chunkLength) {
+      const endDistance = Math.min(route.totalLength, startDistance + chunkLength);
+      const midpoint = (startDistance + endDistance) * 0.5;
+      const ribbon = new Mesh(
+        makeRibbonGeometry(route, sideSign, roadLift, 0.12, startDistance, endDistance),
+        edgeMaterial,
+      );
+      ribbon.name = `${ribbonParent.name}-chunk-${Math.floor(startDistance / chunkLength)}`;
+      ribbon.renderOrder = 2;
+      ribbonParent.add(ribbon);
+      decorative.push({ object: ribbon, routeDistance: midpoint, halfSpan: chunkLength * 0.5 });
+
+      const rail = new Mesh(
+        makeRibbonGeometry(route, sideSign, roadLift + 0.42, 0.08, startDistance, endDistance),
+        edgeMaterial,
+      );
+      rail.name = `${railParent.name}-chunk-${Math.floor(startDistance / chunkLength)}`;
+      railParent.add(rail);
+      const beam = new Mesh(makeGuardrailGeometry(route, sideSign, roadLift, startDistance, endDistance), railMaterial);
+      beam.name = `rift-guardrail-beam-${sideSign}-${Math.floor(startDistance / chunkLength)}`;
+      beam.receiveShadow = true;railParent.add(beam);
+      decorative.push({ object: beam, routeDistance: midpoint, halfSpan: chunkLength * 0.5 });
+      decorative.push({ object: rail, routeDistance: midpoint, halfSpan: chunkLength * 0.5 });
+    }
+    group.add(ribbonParent, railParent);
   }
+
+  const postGeometry = new BoxGeometry(0.11, 0.54, 0.11);
+  const postMaterial = new MeshStandardMaterial({ color: 0x3a365a, roughness: 0.7 });
+  const postsParent = new Group();
+  postsParent.name = "rift-guardrail-posts";
+  const postMatrix = new Matrix4();
+  for (let startDistance = 0; startDistance < route.totalLength; startDistance += chunkLength) {
+    const endDistance = Math.min(route.totalLength, startDistance + chunkLength);
+    const firstIndex = Math.ceil(startDistance / 6);
+    const lastIndex = Math.floor((endDistance - EPSILON) / 6);
+    const count = Math.max(0, lastIndex - firstIndex + 1) * 2;
+    if (count === 0) continue;
+    const posts = new InstancedMesh(postGeometry, postMaterial, count);
+    posts.name = `${postsParent.name}-chunk-${Math.floor(startDistance / chunkLength)}`;
+    for (let index = firstIndex; index <= lastIndex; index += 1) {
+      const distance = index * 6;
+      if (sampleTrackSection(route, distance) === "cliff-dive") {
+        postMatrix.makeScale(0, 0, 0);
+        posts.setMatrixAt((index - firstIndex) * 2, postMatrix);posts.setMatrixAt((index - firstIndex) * 2 + 1, postMatrix);continue;
+      }
+      const center = sampleTrackPosition(route, distance);
+      const side = makeSideVector(sampleTrackTangent(route, distance));
+      for (let sideIndex = 0; sideIndex < 2; sideIndex += 1) {
+        const position = center.clone().addScaledVector(side, (sideIndex === 0 ? 1 : -1) * (sampleTrackWidth(route, distance) * 0.5 + 0.06));
+        position.y += roadLift + 0.29;
+        postMatrix.makeTranslation(position.x, position.y, position.z);
+        posts.setMatrixAt((index - firstIndex) * 2 + sideIndex, postMatrix);
+      }
+    }
+    posts.computeBoundingSphere();
+    postsParent.add(posts);
+    decorative.push({ object: posts, routeDistance: (startDistance + endDistance) * 0.5, halfSpan: chunkLength * 0.5 });
+  }
+  group.add(postsParent);
 
   // Short cyan lane dashes stay on the road surface instead of drawing a
   // closed route line through the sky when the camera looks across a bend.
@@ -596,21 +721,35 @@ function makeTrackGroup(
     blending: AdditiveBlending,
   });
   neonMaterials.push(laneMaterial);
-  const dashCount = Math.floor(route.totalLength / 6);
-  const dashes = new InstancedMesh(new BoxGeometry(0.12, 0.025, 1.8), laneMaterial, dashCount);
-  dashes.name = "rift-cyan-lane-dashes";
+  const dashGeometry = new BoxGeometry(0.12, 0.025, 1.8);
+  const dashesParent = new Group();
+  dashesParent.name = "rift-cyan-lane-dashes";
   const matrix = new Matrix4();
   const rotation = new Quaternion();
-  for (let index = 0; index < dashCount; index += 1) {
-    const distance = index * 6 + 2.8;
-    const position = sampleTrackPosition(route, distance);
-    position.y += roadLift + 0.035;
-    rotation.setFromUnitVectors(FORWARD, sampleTrackTangent(route, distance));
-    matrix.compose(position, rotation, new Vector3(1, 1, 1));
-    dashes.setMatrixAt(index, matrix);
+  for (let startDistance = 0; startDistance < route.totalLength; startDistance += chunkLength) {
+    const endDistance = Math.min(route.totalLength, startDistance + chunkLength);
+    const firstIndex = Math.ceil((startDistance - 2.8) / 6);
+    const lastIndex = Math.floor((endDistance - 2.8 - EPSILON) / 6);
+    const dashCount = Math.max(0, lastIndex - firstIndex + 1);
+    if (dashCount === 0) continue;
+    const dashes = new InstancedMesh(dashGeometry, laneMaterial, dashCount);
+    dashes.name = `${dashesParent.name}-chunk-${Math.floor(startDistance / chunkLength)}`;
+    for (let index = firstIndex; index <= lastIndex; index += 1) {
+      const distance = index * 6 + 2.8;
+      if (sampleTrackSection(route, distance) === "cliff-dive") {
+        matrix.makeScale(0, 0, 0);dashes.setMatrixAt(index - firstIndex, matrix);continue;
+      }
+      const position = sampleTrackPosition(route, distance);
+      position.y += roadLift + 0.035;
+      rotation.setFromUnitVectors(FORWARD, sampleTrackTangent(route, distance));
+      matrix.compose(position, rotation, new Vector3(1, 1, 1));
+      dashes.setMatrixAt(index - firstIndex, matrix);
+    }
+    dashes.computeBoundingSphere();
+    dashesParent.add(dashes);
+    decorative.push({ object: dashes, routeDistance: (startDistance + endDistance) * 0.5, halfSpan: chunkLength * 0.5 });
   }
-  dashes.computeBoundingSphere();
-  group.add(dashes);
+  group.add(dashesParent);
 
   const startLine = new Group();
   startLine.name = "rift-start-finish-line";
@@ -630,101 +769,136 @@ function makeTrackGroup(
     }
   }
   group.add(startLine);
+  decorative.push({ object: startLine, routeDistance: 1, halfSpan: 3 });
 
-  return group;
+  return { group, decorative };
 }
 
 function createPalmTree(): Group {
   const palm = new Group();
   palm.name = "rift-palm";
-  const base = new Mesh(
-    new CylinderGeometry(0.34, 0.44, 0.14, 8),
-    new MeshBasicMaterial({ color: 0x17162d }),
-  );
-  base.name = "rift-palm-ground-base";
-  base.position.y = 0.07;
-  palm.add(base);
-  const trunk = new Mesh(
-    new CylinderGeometry(0.16, 0.28, 4.6, 5),
-    new MeshStandardMaterial({ color: 0x6b4c68, roughness: 1, flatShading: true }),
-  );
-  trunk.position.y = 2.3;
-  trunk.castShadow = true;
-  palm.add(trunk);
-
-  const crownMaterial = new MeshStandardMaterial({
+  const positions: number[] = [];
+  const indices: number[] = [];
+  const addVertex = (x: number, y: number, z: number): number => {
+    positions.push(x, y, z);
+    return positions.length / 3 - 1;
+  };
+  const addBox = (center: Vector3, size: Vector3): void => {
+    const half = size.clone().multiplyScalar(0.5);
+    const base = positions.length / 3;
+    [
+      [-half.x, -half.y, -half.z], [half.x, -half.y, -half.z], [half.x, half.y, -half.z], [-half.x, half.y, -half.z],
+      [-half.x, -half.y, half.z], [half.x, -half.y, half.z], [half.x, half.y, half.z], [-half.x, half.y, half.z],
+    ].forEach(([x, y, z]) => addVertex(center.x + x, center.y + y, center.z + z));
+    indices.push(
+      base, base + 1, base + 2, base, base + 2, base + 3,
+      base + 1, base + 5, base + 6, base + 1, base + 6, base + 2,
+      base + 5, base + 4, base + 7, base + 5, base + 7, base + 6,
+      base + 4, base, base + 3, base + 4, base + 3, base + 7,
+      base + 3, base + 2, base + 6, base + 3, base + 6, base + 7,
+      base + 4, base + 5, base + 1, base + 4, base + 1, base,
+    );
+  };
+  // A low-poly trunk and grounding collar are one mesh so the district can
+  // batch every palm into one instanced draw per route chunk.
+  addBox(new Vector3(0, 0.07, 0), new Vector3(0.72, 0.14, 0.72));
+  const trunkSides = 5;
+  const trunkBase = positions.length / 3;
+  for (let ring = 0; ring <= 1; ring += 1) {
+    const y = 0.14 + ring * 4.38;
+    const radius = ring === 0 ? 0.28 : 0.16;
+    for (let side = 0; side < trunkSides; side += 1) {
+      const angle = side / trunkSides * Math.PI * 2;
+      addVertex(Math.cos(angle) * radius, y, Math.sin(angle) * radius);
+    }
+  }
+  for (let side = 0; side < trunkSides; side += 1) {
+    const next = (side + 1) % trunkSides;
+    indices.push(
+      trunkBase + side, trunkBase + next, trunkBase + trunkSides + next,
+      trunkBase + side, trunkBase + trunkSides + next, trunkBase + trunkSides + side,
+    );
+  }
+  const crownY = 4.55;
+  for (let leafIndex = 0; leafIndex < 7; leafIndex += 1) {
+    const angle = leafIndex / 7 * Math.PI * 2;
+    const direction = new Vector3(Math.sin(angle), 0, Math.cos(angle));
+    const across = new Vector3(direction.z, 0, -direction.x);
+    const leafBase = positions.length / 3;
+    for (let step = 0; step <= 6; step += 1) {
+      const amount = step / 6;
+      const width = Math.sin(amount * Math.PI) * 0.42 + 0.015;
+      const height = Math.sin(amount * Math.PI) * 0.4 - amount * amount * 1.2;
+      const center = direction.clone().multiplyScalar(amount * 3.4).add(new Vector3(0, crownY + height, 0));
+      addVertex(center.x - across.x * width, center.y, center.z - across.z * width);
+      addVertex(center.x + across.x * width, center.y, center.z + across.z * width);
+      if (step < 6) {
+        const vertex = leafBase + step * 2;
+        indices.push(vertex, vertex + 2, vertex + 1, vertex + 1, vertex + 2, vertex + 3);
+      }
+    }
+  }
+  const geometry = new BufferGeometry();
+  geometry.setAttribute("position", new BufferAttribute(new Float32Array(positions), 3));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  geometry.computeBoundingSphere();
+  const material = new MeshStandardMaterial({
     color: 0x245354,
     emissive: 0x091724,
+    emissiveIntensity: 0.65,
     roughness: 0.9,
     flatShading: true,
     side: DoubleSide,
   });
-  const crown = new Group();
-  crown.position.y = 4.55;
-  const leafPositions: number[] = [];
-  const leafIndices: number[] = [];
-  for (let step = 0; step <= 6; step += 1) {
-    const amount = step / 6;
-    const width = Math.sin(amount * Math.PI) * 0.42 + 0.015;
-    const height = Math.sin(amount * Math.PI) * 0.4 - amount * amount * 1.2;
-    leafPositions.push(-width, height, amount * 3.4, width, height, amount * 3.4);
-    if (step < 6) {
-      const base = step * 2;
-      leafIndices.push(base, base + 2, base + 1, base + 1, base + 2, base + 3);
-    }
-  }
-  const leafGeometry = new BufferGeometry();
-  leafGeometry.setAttribute("position", new BufferAttribute(new Float32Array(leafPositions), 3));
-  leafGeometry.setIndex(leafIndices);
-  leafGeometry.computeVertexNormals();
-  for (let index = 0; index < 7; index += 1) {
-    const leaf = new Mesh(leafGeometry, crownMaterial);
-    leaf.rotation.y = (Math.PI * 2 * index) / 7;
-    leaf.scale.setScalar(0.85 + (index % 3) * 0.12);
-    crown.add(leaf);
-  }
-  palm.add(crown);
+  const silhouette = new Mesh(geometry, material);
+  silhouette.name = "rift-palm-silhouette";
+  silhouette.castShadow = true;
+  palm.add(silhouette);
   return palm;
 }
 
 function createStreetLamp(): Group {
   const lamp = new Group();
   lamp.name = "rift-neon-street-lamp";
-  const poleMaterial = new MeshBasicMaterial({ color: 0x3a315d });
-  const base = new Mesh(
-    new CylinderGeometry(0.2, 0.28, 0.14, 8),
-    new MeshBasicMaterial({ color: 0x17162d }),
-  );
-  base.name = "rift-street-lamp-ground-base";
-  base.position.y = 0.07;
-  lamp.add(base);
-  const pole = new Mesh(new CylinderGeometry(0.07, 0.11, 3.8, 5), poleMaterial);
-  pole.position.y = 1.9;
-  lamp.add(pole);
-
-  const arm = new Mesh(new BoxGeometry(0.08, 0.08, 0.95), poleMaterial);
-  arm.position.set(0, 3.72, 0.36);
-  lamp.add(arm);
-
-  const shade = new Mesh(
-    new ConeGeometry(0.22, 0.14, 6),
-    new MeshBasicMaterial({ color: 0x252044 }),
-  );
-  shade.name = "rift-street-lamp-shade";
-  shade.position.set(0, 3.58, 0.78);
-  lamp.add(shade);
-
-  const glow = new Mesh(
-    new SphereGeometry(0.16, 6, 4),
-    new MeshBasicMaterial({
-      color: 0xffd18a,
-      transparent: true,
-      opacity: 0.82,
-      blending: AdditiveBlending,
-    }),
-  );
-  glow.position.set(0, 3.62, 0.78);
-  lamp.add(glow);
+  const positions: number[] = [];
+  const indices: number[] = [];
+  const addBox = (center: Vector3, size: Vector3): void => {
+    const half = size.clone().multiplyScalar(0.5);
+    const base = positions.length / 3;
+    [
+      [-half.x, -half.y, -half.z], [half.x, -half.y, -half.z], [half.x, half.y, -half.z], [-half.x, half.y, -half.z],
+      [-half.x, -half.y, half.z], [half.x, -half.y, half.z], [half.x, half.y, half.z], [-half.x, half.y, half.z],
+    ].forEach(([x, y, z]) => positions.push(center.x + x, center.y + y, center.z + z));
+    indices.push(
+      base, base + 1, base + 2, base, base + 2, base + 3,
+      base + 1, base + 5, base + 6, base + 1, base + 6, base + 2,
+      base + 5, base + 4, base + 7, base + 5, base + 7, base + 6,
+      base + 4, base, base + 3, base + 4, base + 3, base + 7,
+      base + 3, base + 2, base + 6, base + 3, base + 6, base + 7,
+      base + 4, base + 5, base + 1, base + 4, base + 1, base,
+    );
+  };
+  addBox(new Vector3(0, 0.07, 0), new Vector3(0.56, 0.14, 0.56));
+  addBox(new Vector3(0, 1.9, 0), new Vector3(0.16, 3.8, 0.16));
+  addBox(new Vector3(0, 3.72, 0.36), new Vector3(0.08, 0.08, 0.95));
+  addBox(new Vector3(0, 3.58, 0.78), new Vector3(0.44, 0.14, 0.44));
+  addBox(new Vector3(0, 3.62, 0.78), new Vector3(0.09, 0.055, 1));
+  const geometry = new BufferGeometry();
+  geometry.setAttribute("position", new BufferAttribute(new Float32Array(positions), 3));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  geometry.computeBoundingSphere();
+  const material = new MeshStandardMaterial({
+    color: 0x3a315d,
+    emissive: 0x8d3f72,
+    emissiveIntensity: 0.65,
+    roughness: 0.72,
+    metalness: 0.14,
+  });
+  const silhouette = new Mesh(geometry, material);
+  silhouette.name = "rift-street-lamp-silhouette";
+  lamp.add(silhouette);
   return lamp;
 }
 
@@ -768,124 +942,535 @@ function createBuilding(
   return building;
 }
 
-function makeScenery(route: TrackRoute, quality: RiftWorldQuality): Group {
-  const group = new Group();
-  group.name = "rift-coastal-scenery";
-  const palmTemplate = createPalmTree();
-  const lampTemplate = createStreetLamp();
-  const buildingMaterial = new MeshStandardMaterial({
-    color: 0x32314d,
-    roughness: 0.7,
-    metalness: 0.12,
-  });
-  const windowMaterial = new MeshBasicMaterial({
-    color: 0xffc477,
-    transparent: true,
-    opacity: 0.58,
-    blending: AdditiveBlending,
-  });
-  const spacing = quality === "eco" ? 24 : 15;
-  const buildingStride = quality === "eco" ? 3 : 2;
+function makeKiteGeometry(): BufferGeometry {
+  const geometry = new BufferGeometry();
+  geometry.setAttribute("position", new BufferAttribute(new Float32Array([
+    0, 1, 0,
+    -0.72, 0, 0,
+    0, -1, 0,
+    0.72, 0, 0,
+  ]), 3));
+  geometry.setAttribute("uv", new BufferAttribute(new Float32Array([
+    0.5, 1, 0, 0.5, 0.5, 0, 1, 0.5,
+  ]), 2));
+  geometry.setIndex([0, 1, 2, 0, 2, 3]);
+  geometry.computeVertexNormals();
+  geometry.computeBoundingSphere();
+  return geometry;
+}
 
-  for (let distance = 6, index = 0; distance < route.totalLength; distance += spacing, index += 1) {
-    if (sampleTrackSection(route, distance) !== "coastal-boulevard") continue;
+type PlantationSpot = {
+  position: Vector3;
+  scale: number;
+  rotation: number;
+};
+
+/**
+ * Add a small, low-poly plantation layer behind the roadside district. The
+ * district owns the grounded palms and buildings; these silhouettes fill the
+ * gaps between it and the horizon without creating one object per plant.
+ */
+function makePlantation(route: TrackRoute, quality: RiftWorldQuality): Group {
+  const group = new Group();
+  group.name = "rift-plantation";
+
+  const vegetationCap = quality === "eco" ? 28 : quality === "ultra" ? 72 : 48;
+  const spots: PlantationSpot[] = [];
+  const spacing = quality === "eco" ? 34 : quality === "ultra" ? 20 : 26;
+  for (let distance = 18, index = 0; distance < route.totalLength && spots.length < vegetationCap; distance += spacing, index += 1) {
+    const section = sampleTrackSection(route, distance);
+    if (section !== "coastal-boulevard" && section !== "final-skyline") continue;
     const tangent = sampleTrackTangent(route, distance);
     const side = makeSideVector(tangent);
-    const midpoint = sampleTrackPosition(route, distance);
-    const edgeDistance = sampleTrackWidth(route, distance) * 0.5;
-
-    const leftPalm = palmTemplate.clone(true);
-    leftPalm.scale.setScalar(0.82 + (index % 3) * 0.08);
-    leftPalm.position.copy(midpoint).addScaledVector(side, edgeDistance + 5.2);
-    leftPalm.position.y -= 0.2;
-    leftPalm.rotation.y = (index * 0.77) % (Math.PI * 2);
-    group.add(leftPalm);
-
-    if (quality !== "eco" || index % 2 === 0) {
-      const rightPalm = palmTemplate.clone(true);
-      rightPalm.scale.setScalar(0.7 + (index % 2) * 0.12);
-      rightPalm.position.copy(midpoint).addScaledVector(side, -edgeDistance - 6.4);
-      rightPalm.rotation.y = (index * 1.11) % (Math.PI * 2);
-      group.add(rightPalm);
-    }
-
-    const lamp = lampTemplate.clone(true);
-    lamp.position.copy(midpoint).addScaledVector(side, edgeDistance + 2.6);
-    lamp.rotation.y = Math.atan2(tangent.x, tangent.z);
-    group.add(lamp);
-
-    if (index % buildingStride === 0) {
-      const height = 4.5 + (index % 4) * 1.1;
-      const building = createBuilding(height, 3.4 + (index % 3), 3.2, buildingMaterial, windowMaterial);
-      building.position.copy(midpoint).addScaledVector(side, edgeDistance + 8.5);
-      building.position.y -= 0.2;
-      building.rotation.y = Math.atan2(tangent.x, tangent.z) + Math.PI * 0.5;
-      group.add(building);
+    const center = sampleTrackPosition(route, distance);
+    const halfWidth = sampleTrackWidth(route, distance) * 0.5;
+    const clusterCount = quality === "ultra" ? 3 : 2;
+    for (let cluster = 0; cluster < clusterCount && spots.length < vegetationCap; cluster += 1) {
+      const sign = (index + cluster) % 2 === 0 ? 1 : -1;
+      const position = center.clone()
+        .addScaledVector(side, sign * (halfWidth + 3.2 + cluster * 0.35))
+        .addScaledVector(tangent, (cluster - 1) * 2.8);
+      // Use the whole route for the test: this also protects a custom route
+      // whose control points are sparse or whose road crosses at another lap.
+      if (!isClearOfRoad(route, position, 1.5)) continue;
+      if (section === "final-skyline" && center.y < 0.8) continue;
+      position.y -= 0.14;
+      spots.push({
+        position,
+        scale: 0.9 + ((index + cluster) % 4) * 0.16,
+        rotation: index * 0.67 + cluster * 1.8,
+      });
     }
   }
 
+  if (spots.length === 0) return group;
+
+  // Reuse one generated detail map for both plantation layers; creating a
+  // second 512px procedural texture here would cost more than the geometry.
+  const plantationDetail = detailTexture("leaf");
+  const shrubGeometry = new ConeGeometry(1, 1.4, 6);
+  const shrubMaterial = new MeshStandardMaterial({
+    name: "rift-plantation-shrub-material",
+    map: plantationDetail,
+    color: 0x1d5b58,
+    emissive: 0x071d28,
+    emissiveIntensity: 0.5,
+    roughness: 0.95,
+    flatShading: true,
+  });
+  const shrubs = new InstancedMesh(shrubGeometry, shrubMaterial, spots.length);
+  shrubs.name = "rift-plantation-shrubs";
+  const matrix = new Matrix4();
+  const rotation = new Quaternion();
+  spots.forEach((spot, index) => {
+    rotation.setFromAxisAngle(UP, spot.rotation);
+    matrix.compose(
+      spot.position.clone().addScaledVector(UP, spot.scale * 0.62),
+      rotation,
+      new Vector3(spot.scale * 1.35, spot.scale * 1.25, spot.scale * 1.35),
+    );
+    shrubs.setMatrixAt(index, matrix);
+  });
+  shrubs.instanceMatrix.needsUpdate = true;
+  shrubs.computeBoundingSphere();
+  group.add(shrubs);
+
+  const reedCount = Math.min(spots.length, quality === "eco" ? 14 : quality === "ultra" ? 40 : 26);
+  const reedGeometry = new CylinderGeometry(0.09, 0.16, 1.8, 5);
+  const reedMaterial = new MeshStandardMaterial({
+    name: "rift-plantation-reed-material",
+    map: plantationDetail,
+    color: 0x39775f,
+    emissive: 0x0a2a2c,
+    emissiveIntensity: 0.4,
+    roughness: 1,
+    flatShading: true,
+  });
+  const reeds = new InstancedMesh(reedGeometry, reedMaterial, reedCount);
+  reeds.name = "rift-plantation-reeds";
+  for (let index = 0; index < reedCount; index += 1) {
+    const spot = spots[index];
+    rotation.setFromAxisAngle(UP, spot.rotation + 0.35);
+    matrix.compose(
+      spot.position.clone().addScaledVector(UP, 0.9),
+      rotation,
+      new Vector3(spot.scale * 0.46, spot.scale * (1.1 + (index % 3) * 0.18), spot.scale * 0.46),
+    );
+    reeds.setMatrixAt(index, matrix);
+  }
+  reeds.instanceMatrix.needsUpdate = true;
+  reeds.computeBoundingSphere();
+  group.add(reeds);
   return group;
 }
 
-function makeHorizonFog(): Group {
-  const group = new Group();
-  group.name = "rift-horizon-fog";
-  const material = new ShaderMaterial({
-    name: "rift-horizon-fog-material",
-    transparent: true,
-    depthWrite: false,
-    side: DoubleSide,
-    uniforms: {
-      fogColor: { value: new Color(0x46577f) },
-      fogOpacity: { value: 0.16 },
-    },
-    vertexShader: /* glsl */ `
-      varying vec2 vFogUv;
-      void main() {
-        vFogUv = uv;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }
-    `,
-    fragmentShader: /* glsl */ `
-      uniform vec3 fogColor;
-      uniform float fogOpacity;
-      varying vec2 vFogUv;
-      void main() {
-        float lowerFade = smoothstep(0.0, 0.3, vFogUv.y);
-        float upperFade = 1.0 - smoothstep(0.58, 1.0, vFogUv.y);
-        gl_FragColor = vec4(fogColor, fogOpacity * lowerFade * upperFade);
-      }
-    `,
-  });
-  const geometry = new PlaneGeometry(150, 14);
-  const farBand = new Mesh(geometry, material);
-  farBand.name = "rift-distant-fog-band";
-  farBand.position.set(18, 4.2, 48);
-  farBand.frustumCulled = false;
-  group.add(farBand);
+type HorizonBuilding = {
+  position: Vector3;
+  side: Vector3;
+  width: number;
+  height: number;
+  depth: number;
+  rotation: number;
+};
 
-  const sideBand = new Mesh(geometry, material);
-  sideBand.name = "rift-coastal-fog-band";
-  sideBand.position.set(-46, 3.1, -18);
-  sideBand.rotation.y = Math.PI * 0.5;
-  sideBand.frustumCulled = false;
-  group.add(sideBand);
+/**
+ * Batch a sparse second skyline row. The roadside district gives the player
+ * nearby architecture; this layer keeps the horizon legible at a distance
+ * while sharing all geometry and materials.
+ */
+function makeHorizonObjects(route: TrackRoute, quality: RiftWorldQuality, district: Group): Group {
+  const group = new Group();
+  group.name = "rift-horizon-objects";
+  const buildings: HorizonBuilding[] = [];
+  const platforms: Object3D[] = [];
+  district.updateMatrixWorld(true);
+  district.traverse((object) => { if (object.name === "rift-roadside-platform") platforms.push(object); });
+  const groundingRay = new Raycaster(new Vector3(), new Vector3(0, -1, 0), 0, 3);
+  const groundPosition = (position: Vector3): boolean => {
+    groundingRay.ray.origin.copy(position).addScaledVector(UP, 1);
+    const hit = groundingRay.intersectObjects(platforms, false)[0];
+    if (!hit) return false;
+    position.y = hit.point.y;
+    return true;
+  };
+  const spacing = quality === "eco" ? 64 : quality === "ultra" ? 40 : 48;
+  const buildingCap = quality === "eco" ? 16 : quality === "ultra" ? 32 : 24;
+  for (let distance = 12, marker = 0; distance < route.totalLength && buildings.length < buildingCap; distance += spacing, marker += 1) {
+    const section = sampleTrackSection(route, distance);
+    const skyline = section === "final-skyline";
+    if (section !== "coastal-boulevard" && !skyline) continue;
+    const tangent = sampleTrackTangent(route, distance);
+    const side = makeSideVector(tangent).multiplyScalar(skyline && marker % 2 === 0 ? 1 : -1);
+    const center = sampleTrackPosition(route, distance);
+    if (skyline && center.y < 0.8) continue;
+    const edgeDistance = sampleTrackWidth(route, distance) * 0.5;
+    const distanceFromRoad = edgeDistance + 14;
+    const position = center.clone().addScaledVector(side, distanceFromRoad);
+    position.y = center.y - 0.14;
+    if (!isClearOfRoad(route, position, 10)) continue;
+    if (!groundPosition(position)) continue;
+    const baseHeight = skyline ? 10 : 6;
+    buildings.push({
+      position,
+      side: side.clone(),
+      width: skyline ? 7 + (marker % 3) * 2 : 5 + (marker % 3),
+      height: baseHeight + (marker % (skyline ? 5 : 4)) * (skyline ? 4.2 : 2.4),
+      depth: skyline ? 5 : 4,
+      rotation: Math.atan2(tangent.x, tangent.z) + Math.PI * 0.5,
+    });
+
+    if (skyline && quality !== "eco" && marker % 3 === 0 && buildings.length < buildingCap) {
+      const opposite = center.clone().addScaledVector(side, -distanceFromRoad);
+      opposite.y = center.y - 0.14;
+      if (isClearOfRoad(route, opposite, 10) && groundPosition(opposite)) {
+        buildings.push({
+          position: opposite,
+          side: side.clone().negate(),
+          width: 4.5 + (marker % 2),
+          height: baseHeight + 2 + (marker % 3) * 3,
+          depth: 3.5,
+          rotation: Math.atan2(tangent.x, tangent.z) - Math.PI * 0.5,
+        });
+      }
+    }
+  }
+
+  if (buildings.length === 0) return group;
+
+  const blockGeometry = new BoxGeometry(1, 1, 1);
+  const buildingMaterial = new MeshStandardMaterial({
+    name: "rift-horizon-building-material",
+    map: sceneryTexture("facade"),
+    color: 0xb2a6c9,
+    emissive: 0x110d2c,
+    emissiveIntensity: 0.55,
+    roughness: 0.7,
+    metalness: 0.12,
+  });
+  const blocks = new InstancedMesh(blockGeometry, buildingMaterial, buildings.length);
+  blocks.name = "rift-distant-building-blocks";
+  blocks.castShadow = false;
+  blocks.receiveShadow = false;
+  const facadeGeometry = new PlaneGeometry(1, 1);
+  const facadeMaterial = new MeshBasicMaterial({
+    name: "rift-horizon-window-material",
+    map: sceneryTexture("facade"),
+    color: 0xc5b8da,
+    transparent: true,
+    opacity: 0.62,
+    depthWrite: false,
+  });
+  const facades = new InstancedMesh(facadeGeometry, facadeMaterial, buildings.length);
+  facades.name = "rift-distant-building-facades";
+  const blockMatrix = new Matrix4();
+  const facadeMatrix = new Matrix4();
+  const rotation = new Quaternion();
+  for (let index = 0; index < buildings.length; index += 1) {
+    const building = buildings[index];
+    const base = building.position.clone();
+    rotation.setFromAxisAngle(UP, building.rotation);
+    blockMatrix.compose(
+      base.clone().addScaledVector(UP, building.height * 0.5),
+      rotation,
+      new Vector3(building.width, building.height, building.depth),
+    );
+    blocks.setMatrixAt(index, blockMatrix);
+    const facadePosition = base.clone()
+      .addScaledVector(building.side, -building.depth * 0.5 - 0.04)
+      .addScaledVector(UP, building.height * 0.58);
+    rotation.setFromAxisAngle(UP, Math.atan2(-building.side.x, -building.side.z));
+    facadeMatrix.compose(
+      facadePosition,
+      rotation,
+      new Vector3(building.width * 0.72, building.height * 0.62, 1),
+    );
+    facades.setMatrixAt(index, facadeMatrix);
+  }
+  blocks.instanceMatrix.needsUpdate = true;
+  facades.instanceMatrix.needsUpdate = true;
+  blocks.computeBoundingSphere();
+  facades.computeBoundingSphere();
+  group.add(blocks, facades);
+
+  const skylineCap = quality === "eco" ? 6 : quality === "ultra" ? 20 : 12;
+  const antennaGeometry = new CylinderGeometry(0.09, 0.16, 1, 5);
+  const antennaMaterial = new MeshBasicMaterial({
+    name: "rift-horizon-antenna-material",
+    color: new Color(0x58dfff).multiplyScalar(1.8),
+    transparent: true,
+    opacity: 0.78,
+    depthWrite: false,
+    blending: AdditiveBlending,
+  });
+  const antennas = new InstancedMesh(antennaGeometry, antennaMaterial, Math.min(skylineCap, buildings.length));
+  antennas.name = "rift-skyline-antennas";
+  const rooftopGeometry = new BoxGeometry(1, 0.12, 0.22);
+  const rooftopMaterial = new MeshBasicMaterial({
+    name: "rift-skyline-rooftop-light-material",
+    color: new Color(0xff5fbb).multiplyScalar(1.7),
+    transparent: true,
+    opacity: 0.74,
+    depthWrite: false,
+    blending: AdditiveBlending,
+  });
+  const rooftops = new InstancedMesh(rooftopGeometry, rooftopMaterial, Math.min(skylineCap, buildings.length));
+  rooftops.name = "rift-skyline-rooftop-lights";
+  const antennaMatrix = new Matrix4();
+  const rooftopMatrix = new Matrix4();
+  const identityRotation = new Quaternion();
+  for (let index = 0; index < Math.min(skylineCap, buildings.length); index += 1) {
+    const building = buildings[(index * 2) % buildings.length];
+    antennaMatrix.makeTranslation(
+      building.position.x,
+      building.position.y + building.height + 0.85 + (index % 2) * 0.25,
+      building.position.z,
+    );
+    antennas.setMatrixAt(index, antennaMatrix);
+    rooftopMatrix.compose(
+      building.position.clone().addScaledVector(UP, building.height + 0.1),
+      identityRotation,
+      new Vector3(building.width * 0.58, 1, building.depth * 0.12),
+    );
+    rooftops.setMatrixAt(index, rooftopMatrix);
+  }
+  antennas.instanceMatrix.needsUpdate = true;
+  rooftops.instanceMatrix.needsUpdate = true;
+  antennas.computeBoundingSphere();
+  rooftops.computeBoundingSphere();
+  group.add(antennas, rooftops);
   return group;
+}
+
+function makeAirborneScenery(route: TrackRoute, quality: RiftWorldQuality): {
+  group: Group;
+  airborne: AirborneCue[];
+} {
+  const group = new Group();
+  group.name = "rift-sky-events";
+  const airborne: AirborneCue[] = [];
+  const balloonCap = quality === "eco" ? 2 : quality === "ultra" ? 7 : 4;
+  const kiteCap = quality === "eco" ? 1 : quality === "ultra" ? 5 : 3;
+  const balloonGeometry = new SphereGeometry(1, quality === "ultra" ? 10 : 8, quality === "ultra" ? 7 : 6);
+  const balloonMaterial = new MeshBasicMaterial({
+    name: "rift-airborne-balloon-material",
+    color: new Color(0xff648f).multiplyScalar(1.6),
+    transparent: true,
+    opacity: 0.82,
+    depthWrite: false,
+    blending: AdditiveBlending,
+  });
+  const balloons = new InstancedMesh(balloonGeometry, balloonMaterial, balloonCap);
+  balloons.name = "rift-airborne-balloons";
+  const kites = new InstancedMesh(
+    makeKiteGeometry(),
+    new MeshBasicMaterial({
+      name: "rift-airborne-kite-material",
+      color: new Color(0x63e8ff).multiplyScalar(1.35),
+      transparent: true,
+      opacity: 0.8,
+      depthWrite: false,
+      blending: AdditiveBlending,
+      side: DoubleSide,
+    }),
+    kiteCap,
+  );
+  kites.name = "rift-airborne-kites";
+  const matrix = new Matrix4();
+  const identityRotation = new Quaternion();
+  let balloonIndex = 0;
+  let kiteIndex = 0;
+  const spacing = quality === "eco" ? 220 : quality === "ultra" ? 150 : 185;
+  for (let distance = 90, marker = 0; distance < route.totalLength && (balloonIndex < balloonCap || kiteIndex < kiteCap); distance += spacing, marker += 1) {
+    const section = sampleTrackSection(route, distance);
+    if (section !== "coastal-boulevard" && section !== "causeway" && section !== "final-skyline") continue;
+    const tangent = sampleTrackTangent(route, distance);
+    const side = makeSideVector(tangent);
+    const center = sampleTrackPosition(route, distance);
+    const halfWidth = sampleTrackWidth(route, distance) * 0.5;
+    const position = center.clone().addScaledVector(side, (marker % 2 === 0 ? 1 : -1) * (halfWidth + 44 + (marker % 3) * 10));
+    if (!isClearOfRoad(route, position, 14)) continue;
+    if (balloonIndex < balloonCap) {
+      const balloonPosition = position.clone().addScaledVector(UP, 19 + (marker % 3) * 3.5);
+      const scale = new Vector3(2, 2.55, 2);
+      matrix.compose(balloonPosition, identityRotation, scale);
+      balloons.setMatrixAt(balloonIndex, matrix);
+      airborne.push({ mesh: balloons, index: balloonIndex, basePosition: balloonPosition, scale, rotation: identityRotation.clone(), phase: marker * 1.27 });
+      balloonIndex += 1;
+    }
+    if (kiteIndex < kiteCap && marker % 2 === 1) {
+      const kitePosition = position.clone().addScaledVector(tangent, 12).addScaledVector(UP, 29 + (marker % 2) * 4);
+      const scale = new Vector3(2.8, 3.5, 1);
+      const rotation = new Quaternion().setFromAxisAngle(UP, marker * 0.8);
+      matrix.compose(kitePosition, rotation, scale);
+      kites.setMatrixAt(kiteIndex, matrix);
+      airborne.push({ mesh: kites, index: kiteIndex, basePosition: kitePosition, scale, rotation, phase: marker * 1.71 + 0.8 });
+      kiteIndex += 1;
+    }
+  }
+  balloons.count = balloonIndex;
+  kites.count = kiteIndex;
+  if (balloonIndex > 0) {
+    balloons.instanceMatrix.needsUpdate = true;
+    balloons.computeBoundingSphere();
+    group.add(balloons);
+  }
+  if (kiteIndex > 0) {
+    kites.instanceMatrix.needsUpdate = true;
+    kites.computeBoundingSphere();
+    group.add(kites);
+  }
+  return { group, airborne };
+}
+
+function makeScenery(route: TrackRoute, quality: RiftWorldQuality): SceneryData {
+  const district = createRoadsideDistrict(route, quality, createPalmTree(), createStreetLamp());
+  const plantation = makePlantation(route, quality);
+  const horizon = makeHorizonObjects(route, quality, district);
+  const airborneData = makeAirborneScenery(route, quality);
+  // Architecture belongs to the grounded roadside district. An additional
+  // horizon row stays sparse and well clear of the racing surface.
+  district.add(plantation, horizon, airborneData.group);
+  return { group: district, airborne: airborneData.airborne };
 }
 
 type TunnelCue = {
   ring: Mesh<TorusGeometry, MeshBasicMaterial>;
   phase: number;
+  lightMaterial: MeshBasicMaterial;
 };
 
+type UnderwaterMaterial = ShaderMaterial & {
+  uniforms: ShaderMaterial["uniforms"] & { time: { value: number } };
+};
+
+function makeTunnelArchGeometry(): TorusGeometry {
+  // A unit arch is scaled per route width. Keeping one geometry avoids the
+  // slightly different faceting and floating-point seams of per-ring toruses.
+  return new TorusGeometry(1, 0.018, 6, 24, Math.PI);
+}
+
+function makeUnderwaterGlassMaterial(
+  name: string,
+  causticOnly = false,
+  volumeOnly = false,
+): UnderwaterMaterial {
+  return new ShaderMaterial({
+    name,
+    transparent: true,
+    depthWrite: false,
+    side: DoubleSide,
+    blending: AdditiveBlending,
+    uniforms: { time: { value: 0 } },
+    vertexShader: /* glsl */ `
+      varying vec3 vWorldPosition;
+      varying vec3 vGlassNormal;
+      void main() {
+        vWorldPosition = (modelMatrix * vec4(position, 1.0)).xyz;
+        vGlassNormal = normalize(mat3(modelMatrix) * normal);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform float time;
+      varying vec3 vWorldPosition;
+      varying vec3 vGlassNormal;
+      void main() {
+        vec3 p = vWorldPosition;
+        float waveA = sin(p.x * 0.52 + time * 1.45 + sin(p.z * 0.19 - time * 0.55));
+        float waveB = sin(p.z * 0.78 - time * 1.05 + sin(p.x * 0.13 + time * 0.38));
+        float caustic = smoothstep(0.18, 0.92, waveA * 0.55 + waveB * 0.45);
+        float thinBand = smoothstep(0.72, 0.97, sin(p.x * 1.7 - p.z * 0.34 + time * 2.15) * 0.5 + 0.5);
+        vec3 deepBlue = vec3(0.015, 0.20, 0.34);
+        vec3 cyan = vec3(0.08, 0.78, 0.92);
+         vec3 color = mix(deepBlue, cyan, caustic * 0.78 + thinBand * 0.22);
+         float fresnel = pow(1.0 - abs(dot(normalize(vGlassNormal), normalize(cameraPosition-p))), 3.0);
+         float alpha = ${causticOnly
+           ? "0.01 + caustic * 0.05 + thinBand * 0.035"
+           : volumeOnly
+             ? "0.065 + fresnel * 0.025 + caustic * 0.045"
+             : "0.025 + fresnel * 0.14 + caustic * 0.025"};
+         alpha *= exp(-0.000625 * dot(cameraPosition-p,cameraPosition-p));
+         gl_FragColor = vec4(color * ${causticOnly ? "1.75" : volumeOnly ? "0.68" : "0.9"}, alpha);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+  }) as UnderwaterMaterial;
+}
+
+function makeFishGeometry(): BufferGeometry {
+  // A deliberately flat silhouette reads as wildlife outside the glass from
+  // the chase camera, without the visual bulk of a cone or sphere.
+  const positions = new Float32Array([
+    0.92, 0, 0, 0.22, 0.26, 0, -0.62, 0.16, 0,
+    -0.62, 0.16, 0, -0.62, -0.16, 0, 0.22, -0.26, 0,
+    -0.62, 0.08, 0, -1.12, 0.48, 0, -0.94, 0, 0,
+    -0.62, -0.08, 0, -0.94, 0, 0, -1.12, -0.48, 0,
+    0.06, 0.18, 0, -0.2, 0.58, 0, -0.42, 0.18, 0,
+  ]);
+  const geometry = new BufferGeometry();
+  geometry.setAttribute("position", new BufferAttribute(positions, 3));
+  geometry.setIndex([
+    0, 1, 2, 2, 4, 5, 5, 0, 2,
+    6, 7, 8, 9, 10, 11,
+  ]);
+  geometry.computeVertexNormals();
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+
+function makeKelpBladeGeometry(): BufferGeometry {
+  const positions: number[] = [];
+  const indices: number[] = [];
+  const steps = 6;
+  for (let step = 0; step <= steps; step += 1) {
+    const amount = step / steps;
+    const sway = Math.sin(amount * Math.PI * 1.35) * 0.55;
+    const width = (1 - amount * 0.72) * 0.3;
+    const height = amount * 6.2;
+    positions.push(sway - width, height, amount * 0.18, sway + width, height, amount * 0.18);
+    if (step < steps) {
+      const vertex = step * 2;
+      indices.push(vertex, vertex + 2, vertex + 1, vertex + 1, vertex + 2, vertex + 3);
+    }
+  }
+  const geometry = new BufferGeometry();
+  geometry.setAttribute("position", new BufferAttribute(new Float32Array(positions), 3));
+  geometry.setAttribute("uv", new Float32BufferAttribute(Array.from({ length: steps + 1 }, (_, step) => [0, step / steps, 1, step / steps]).flat(), 2));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  geometry.computeBoundingSphere();
+  return geometry;
+}
+
+function makeKelpCluster(
+  bladeGeometry: BufferGeometry,
+  material: MeshBasicMaterial,
+  scale: number,
+  index: number,
+): Group {
+  const cluster = new Group();
+  cluster.name = "rift-underwater-kelp";
+  const bladeCount = scale > 0.9 ? 3 : 2;
+  for (let bladeIndex = 0; bladeIndex < bladeCount; bladeIndex += 1) {
+    const blade = new Mesh(bladeGeometry, material);
+    blade.scale.setScalar(scale * (0.86 + (bladeIndex % 3) * 0.12));
+    blade.rotation.y = index * 0.7 + bladeIndex * 1.8;
+    blade.rotation.z = (bladeIndex - 1) * 0.12;
+    cluster.add(blade);
+  }
+  return cluster;
+}
+
 /** Continuous cross sections prevent gaps and overlapping cylinders on bends. */
-function makeCanopyGeometry(route: TrackRoute, section: TrackSection, fullTube = false): BufferGeometry {
+function makeCanopyGeometry(route: TrackRoute, section: TrackSection, fullTube = false, radialSteps = 32): BufferGeometry {
   const frames = makeRouteFrames(route);
   const positions: number[] = [];
   const indices: number[] = [];
-  const radialSteps = 16;
+  const dive = getDiveLayout(route);
   for (const segment of route.segments) {
     if (segment.section !== section) continue;
+    if (section === "tunnel" && dive && segment.endDistance > dive.approachStart) continue;
     const base = positions.length / 3;
     for (const pointIndex of segmentPointIndices(route, segment.index)) {
       const point = route.points[pointIndex];
@@ -908,6 +1493,7 @@ function makeCanopyGeometry(route: TrackRoute, section: TrackSection, fullTube =
   geometry.setAttribute("position", new BufferAttribute(new Float32Array(positions), 3));
   geometry.setIndex(indices);
   geometry.computeVertexNormals();
+  geometry.computeBoundingSphere();
   return geometry;
 }
 
@@ -919,13 +1505,31 @@ function makeTunnelCues(route: TrackRoute, quality: RiftWorldQuality): {
   group.name = "rift-tunnel-cues";
   const cues: TunnelCue[] = [];
   const material = new MeshBasicMaterial({
-    color: 0xc8569f,
+    color: new Color(0xf54fbc).multiplyScalar(3),
     transparent: true,
     opacity: 0.56,
     depthWrite: false,
     blending: AdditiveBlending,
     side: DoubleSide,
   });
+  const cyanLightMaterial = new MeshBasicMaterial({
+    name: "rift-tunnel-cyan-light-material",
+    color: new Color(0x55eaff).multiplyScalar(2.5),
+    transparent: true,
+    opacity: 0.78,
+    depthWrite: false,
+    blending: AdditiveBlending,
+  });
+  const pinkLightMaterial = new MeshBasicMaterial({
+    name: "rift-tunnel-pink-light-material",
+    color: new Color(0xff63c7).multiplyScalar(2.5),
+    transparent: true,
+    opacity: 0.78,
+    depthWrite: false,
+    blending: AdditiveBlending,
+  });
+  const archGeometry = makeTunnelArchGeometry();
+  const lightGeometry = new BoxGeometry(0.14, 0.07, 1.25);
   const shellMaterial = new MeshStandardMaterial({
     name: "rift-tunnel-shell-material",
     color: 0x22243c,
@@ -938,21 +1542,35 @@ function makeTunnelCues(route: TrackRoute, quality: RiftWorldQuality): {
   shell.name = "rift-tunnel-shell";
   shell.receiveShadow = true;
   group.add(shell);
-  const spacing = quality === "eco" ? 18 : 11;
+  const spacing = quality === "eco" ? 18 : quality === "ultra" ? 8 : 11;
 
-  for (let distance = 0; distance < route.totalLength; distance += spacing) {
+  for (let distance = spacing * 0.5; distance < route.totalLength; distance += spacing) {
     if (sampleTrackSection(route, distance) !== "tunnel") continue;
+    const dive = getDiveLayout(route);
+    if (dive && distance >= dive.approachStart) continue;
     const tangent = sampleTrackTangent(route, distance);
     const center = sampleTrackPosition(route, distance);
     center.y += 0.2;
     const radius = sampleTrackWidth(route, distance) * 0.5 + 1.18;
-    const ring = new Mesh(new TorusGeometry(radius, 0.09, 6, 24, Math.PI), material);
+    const ring = new Mesh(archGeometry, material);
     ring.name = "rift-tunnel-neon-arch";
     ring.position.copy(center);
-    ring.quaternion.setFromUnitVectors(FORWARD, tangent);
+    ring.scale.set(radius, radius, 1);
+    ring.rotation.set(-Math.atan2(tangent.y, Math.hypot(tangent.x, tangent.z)),
+      Math.atan2(tangent.x, tangent.z), 0, "YXZ");
     ring.renderOrder = 3;
     group.add(ring);
-    cues.push({ ring, phase: distance * 0.02 });
+
+    const lightMaterial = (Math.floor(distance / spacing) % 2 === 0)
+      ? cyanLightMaterial
+      : pinkLightMaterial;
+    const light = new Mesh(lightGeometry, lightMaterial);
+    light.name = "rift-tunnel-arch-light";
+    light.position.copy(center).addScaledVector(UP, radius - 0.08);
+    light.quaternion.copy(ring.quaternion);
+    light.renderOrder = 4;
+    group.add(light);
+    cues.push({ ring, phase: distance * 0.02, lightMaterial });
   }
 
   return { group, cues };
@@ -963,52 +1581,70 @@ type UnderwaterCue = {
   baseY: number;
   phase: number;
   amplitude: number;
+  baseScale: number;
 };
 
 function makeUnderwaterCues(route: TrackRoute, quality: RiftWorldQuality): {
   group: Group;
   bubbles: UnderwaterCue[];
+  materials: UnderwaterMaterial[];
 } {
   const group = new Group();
   group.name = "rift-underwater-cues";
+  group.add(createUnderwaterStructure(route, quality));
   const bubbles: UnderwaterCue[] = [];
-  const bubbleGeometry = new SphereGeometry(0.18, 6, 4);
-  const bubbleMaterial = new MeshBasicMaterial({
+  const bubbleGeometry = new SphereGeometry(0.11, quality === "ultra" ? 20 : 12, quality === "ultra" ? 12 : 8);
+  const bubbleMaterial = new MeshPhysicalMaterial({
     color: 0x53e8ff,
     transparent: true,
-    opacity: 0.56,
+    opacity: 0.18,
+    roughness: 0.12,
+    metalness: 0.2,
+    clearcoat: 1,
     depthWrite: false,
-    blending: AdditiveBlending,
   });
-  const kelpMaterial = new MeshBasicMaterial({ color: 0x064f72, transparent: true, opacity: 0.82 });
-  const glassMaterial = new MeshBasicMaterial({
-    name: "rift-underwater-glass-material",
-    color: 0x1c9bd1,
-    transparent: true,
-    opacity: 0.13,
-    depthWrite: false,
-    side: DoubleSide,
-    blending: AdditiveBlending,
-  });
-  const fishMaterial = new MeshBasicMaterial({
-    name: "rift-underwater-fish-material",
-    color: 0x45dff5,
-    transparent: true,
-    opacity: 0.72,
-    depthWrite: false,
-    blending: AdditiveBlending,
-  });
-  const sharkMaterial = new MeshBasicMaterial({
-    name: "rift-underwater-shark-material",
-    color: 0x315c9d,
+  const kelpMaterial = new MeshBasicMaterial({
+    name: "rift-underwater-kelp-material",
+    map: detailTexture("leaf"),
+    color: 0x087e79,
     transparent: true,
     opacity: 0.82,
+    side: DoubleSide,
+  });
+  const glassMaterial = makeUnderwaterGlassMaterial("rift-underwater-glass-material");
+  const causticMaterial = makeUnderwaterGlassMaterial("rift-underwater-caustic-material", true);
+  const fishMap = sceneryTexture("fish");
+  const fishMaterial = new SpriteMaterial({
+    name: "rift-underwater-fish-material",
+    map: fishMap,
+    color: 0xdafaff,
+    transparent: true,
+    opacity: 0.95,
+    alphaTest: 0.04,
     depthWrite: false,
   });
-  const glassTube = new Mesh(makeCanopyGeometry(route, "underwater", true), glassMaterial);
+  const sharkMaterial = new SpriteMaterial({
+    name: "rift-underwater-shark-material",
+    map: fishMap,
+    color: 0x7e9fbf,
+    transparent: true,
+    opacity: 0.82,
+    alphaTest: 0.04,
+    depthWrite: false,
+  });
+  const glassGeometry = makeCanopyGeometry(route, "underwater", true, quality === "ultra" ? 64 : quality === "eco" ? 24 : 40);
+  const glassTube = new Mesh(glassGeometry, glassMaterial);
   glassTube.name = "rift-underwater-glass-tube";
+  glassTube.renderOrder = 1;
   group.add(glassTube);
-  const spacing = quality === "eco" ? 26 : 17;
+  const causticTube = new Mesh(glassGeometry, causticMaterial);
+  causticTube.name = "rift-underwater-caustic-bands";
+  causticTube.renderOrder = 2;
+  group.add(causticTube);
+  const kelpGeometry = makeKelpBladeGeometry();
+  const spacing = quality === "eco" ? 26 : quality === "ultra" ? 12 : 17;
+  const fishPerStation = quality === "ultra" ? 2 : 1;
+  const bubblesPerStation = quality === "eco" ? 2 : quality === "ultra" ? 4 : 3;
   for (let distance = 0, index = 0; distance < route.totalLength; distance += spacing, index += 1) {
     if (sampleTrackSection(route, distance) !== "underwater") continue;
     const tangent = sampleTrackTangent(route, distance);
@@ -1016,9 +1652,9 @@ function makeUnderwaterCues(route: TrackRoute, quality: RiftWorldQuality): {
     const center = sampleTrackPosition(route, distance);
     const width = Math.max(5, sampleTrackWidth(route, distance) * 0.5);
 
-    for (let bubbleIndex = 0; bubbleIndex < (quality === "eco" ? 2 : 3); bubbleIndex += 1) {
+    for (let bubbleIndex = 0; bubbleIndex < bubblesPerStation; bubbleIndex += 1) {
       const bubble = new Mesh(bubbleGeometry, bubbleMaterial);
-      const offset = (bubbleIndex - 1) * 1.8;
+      const offset = (bubbleIndex % 2 === 0 ? 1 : -1) * (width + 2.2 + bubbleIndex * 0.4);
       bubble.position
         .copy(center)
         .addScaledVector(side, offset + (index % 2) * 0.5)
@@ -1031,52 +1667,67 @@ function makeUnderwaterCues(route: TrackRoute, quality: RiftWorldQuality): {
         baseY: bubble.position.y,
         phase: index * 0.63 + bubbleIndex * 1.3,
         amplitude: 0.25 + bubbleIndex * 0.08,
+        baseScale: 0.7 + bubbleIndex * 0.22,
       });
     }
 
-    const fish = new Mesh(new ConeGeometry(0.22, 1.4, 5), fishMaterial);
-    fish.name = "rift-underwater-fish";
-    fish.position
-      .copy(center)
-      .addScaledVector(side, width + 1.8)
-      .addScaledVector(tangent, (index % 2 === 0 ? -1 : 1) * 1.9);
-    fish.position.y += 1.4 + (index % 3) * 0.45;
-    fish.quaternion.setFromUnitVectors(UP, tangent);
-    group.add(fish);
-    bubbles.push({
-      object: fish,
-      baseY: fish.position.y,
-      phase: index * 0.51 + 0.4,
-      amplitude: 0.18,
-    });
+    for (let fishIndex = 0; fishIndex < fishPerStation; fishIndex += 1) {
+      const fish = new Sprite(fishIndex === 0 ? fishMaterial : sharkMaterial);
+      fish.name = fishIndex === 0 ? "rift-underwater-fish" : "rift-underwater-fish-schoolmate";
+      fish.position
+        .copy(center)
+        .addScaledVector(side, (fishIndex % 2 === 0 ? 1 : -1) * (width + 1.8))
+        .addScaledVector(tangent, (index % 2 === 0 ? -1 : 1) * (1.9 + fishIndex * 1.2));
+      fish.position.y += 1.4 + (index % 3) * 0.45 + fishIndex * 1.1;
+      fish.quaternion.setFromUnitVectors(new Vector3(1, 0, 0), tangent);
+      const fishScale = (fishIndex === 0 ? 0.92 : 2.15) * (0.9 + (index % 3) * 0.08);
+      fish.scale.set(fishScale * 2.4, fishScale * 1.2, 1);
+      group.add(fish);
+      bubbles.push({
+        object: fish,
+        baseY: fish.position.y,
+        phase: index * 0.51 + fishIndex * 0.9 + 0.4,
+        amplitude: 0.18,
+        baseScale: fishScale,
+      });
+    }
 
-    if (index % 5 === 0) {
-      const shark = new Mesh(new ConeGeometry(0.5, 3.4, 5), sharkMaterial);
+    if (index % 5 === 0 && fishPerStation === 1) {
+      const shark = new Sprite(sharkMaterial);
       shark.name = "rift-underwater-shark-silhouette";
       shark.position
         .copy(center)
         .addScaledVector(side, width + 4.6)
         .addScaledVector(tangent, -2.4);
       shark.position.y += 2.6;
-      shark.quaternion.setFromUnitVectors(UP, tangent);
+      shark.quaternion.setFromUnitVectors(new Vector3(1, 0, 0), tangent);
+      shark.scale.set(5.16, 2.58, 1);
       group.add(shark);
       bubbles.push({
         object: shark,
         baseY: shark.position.y,
         phase: index * 0.7 + 1.1,
         amplitude: 0.12,
+        baseScale: 2.15,
       });
     }
 
-    const kelp = new Mesh(new ConeGeometry(1.5, 5.6, 5), kelpMaterial);
-    kelp.name = "rift-underwater-kelp";
+    const plantScale = quality === "eco" ? 0.82 : quality === "ultra" ? 1.12 : 0.98;
+    const kelp = makeKelpCluster(kelpGeometry, kelpMaterial, plantScale, index);
     kelp.position.copy(center).addScaledVector(side, width + 1.5);
-    kelp.position.y -= 1.7;
+    kelp.position.y -= 6.3;
     kelp.rotation.z = 0.16 + (index % 3) * 0.12;
     group.add(kelp);
+    if (quality !== "eco" && index % 2 === 0) {
+      const farKelp = makeKelpCluster(kelpGeometry, kelpMaterial, plantScale * 0.78, index + 2);
+      farKelp.position.copy(center).addScaledVector(side, -(width + 2.4));
+      farKelp.position.y -= 6.3;
+      farKelp.rotation.z = -0.12;
+      group.add(farKelp);
+    }
   }
 
-  return { group, bubbles };
+  return { group, bubbles, materials: [glassMaterial, causticMaterial] };
 }
 
 function disposeObject(root: Object3D): void {
@@ -1093,10 +1744,13 @@ function disposeObject(root: Object3D): void {
     } else if (renderable.material) {
       materials.add(renderable.material);
     }
-    if (object instanceof Light) object.dispose();
+    if (object instanceof Light || object instanceof InstancedMesh) object.dispose();
   });
   geometries.forEach((geometry) => geometry.dispose());
-  materials.forEach((material) => material.dispose());
+  materials.forEach((material) => {
+    for (const value of Object.values(material)) if (value instanceof Texture) value.dispose();
+    material.dispose();
+  });
 }
 
 /**
@@ -1107,16 +1761,25 @@ export class RiftWorld extends Group {
   readonly route: TrackRoute;
   readonly quality: RiftWorldQuality;
   readonly track: Group;
+  readonly startGate: Group;
+  readonly cliffTransition: Group;
   readonly scenery: Group;
   readonly tunnelCues: Group;
   readonly underwaterCues: Group;
   readonly sky: Mesh<SphereGeometry, ShaderMaterial>;
   private readonly environment: Group;
+  private readonly shadowLight?: DirectionalLight;
 
   private readonly neonMaterials: MeshBasicMaterial[] = [];
   private readonly tunnelCueData: TunnelCue[];
   private readonly bubbleData: UnderwaterCue[];
+  private readonly underwaterMaterials: UnderwaterMaterial[];
   private readonly dynamicLightData: DynamicLightData[] = [];
+  private readonly decorativeCullItems: DecorativeCullItem[];
+  private readonly airborneCues: AirborneCue[];
+  private readonly diveTransition: CliffDiveTransition;
+  readonly localVisibility: LocalSceneVisibility;
+  private readonly sectionRanges = new Map<TrackSection, Array<{ start: number; end: number }>>();
   private elapsedSeconds = 0;
   private disposed = false;
 
@@ -1125,6 +1788,13 @@ export class RiftWorld extends Group {
     this.name = "rift-racer-world";
     this.route = options.route ?? SAMPLE_ROUTE;
     this.quality = options.quality ?? "balanced";
+    for (const span of this.route.segments) {
+      const ranges = this.sectionRanges.get(span.section) ?? [];
+      const previous = ranges[ranges.length - 1];
+      if (previous && Math.abs(previous.end - span.startDistance) < EPSILON) previous.end = span.endDistance;
+      else ranges.push({ start: span.startDistance, end: span.endDistance });
+      this.sectionRanges.set(span.section, ranges);
+    }
 
     const roadLift = Math.max(0, finiteOr(options.roadLift, 0.035));
     this.sky = makeGradientSky();
@@ -1139,12 +1809,14 @@ export class RiftWorld extends Group {
     const rimLight = new PointLight(0x9e3f88, rimIntensity, 150, 2);
     rimLight.name = "rift-rim-light";
     rimLight.position.set(-14, 18, -18);
+    rimLight.visible = this.quality !== "eco";
     this.add(rimLight);
     this.dynamicLightData.push({ light: rimLight, baseIntensity: rimIntensity, phase: 0.4 });
     const waterIntensity = this.quality === "ultra" ? 4.1 : this.quality === "eco" ? 1.4 : 2.7;
     const waterLight = new PointLight(0x18a6ff, waterIntensity, 120, 2);
     waterLight.name = "rift-water-light";
     waterLight.position.set(-34, -2, -34);
+    waterLight.visible = this.quality !== "eco";
     this.add(waterLight);
     this.dynamicLightData.push({ light: waterLight, baseIntensity: waterIntensity, phase: 1.8 });
 
@@ -1160,11 +1832,12 @@ export class RiftWorld extends Group {
       keyLight.shadow.normalBias = 0.04;
       keyLight.shadow.camera.near = 1;
       keyLight.shadow.camera.far = 300;
-      keyLight.shadow.camera.left = -155;
-      keyLight.shadow.camera.right = 155;
-      keyLight.shadow.camera.top = 155;
-      keyLight.shadow.camera.bottom = -155;
+      keyLight.shadow.camera.left = -38;
+      keyLight.shadow.camera.right = 38;
+      keyLight.shadow.camera.top = 38;
+      keyLight.shadow.camera.bottom = -38;
       this.add(keyLight, keyLight.target);
+      this.shadowLight = keyLight;
 
       const cyanFill = new PointLight(0x26cfff, 8, 48, 2);
       cyanFill.name = "rift-ultra-cyan-fill";
@@ -1173,12 +1846,21 @@ export class RiftWorld extends Group {
       this.dynamicLightData.push({ light: cyanFill, baseIntensity: 2.2, phase: 3.1 });
     }
 
-    this.track = makeTrackGroup(this.route, roadLift, this.neonMaterials);
+    const trackData = makeTrackGroup(this.route, roadLift, this.neonMaterials, this.quality);
+    this.track = trackData.group;
+    this.decorativeCullItems = trackData.decorative;
+    this.startGate = createStartGate(this.route, roadLift);
+    this.track.add(this.startGate);
+    this.diveTransition = new CliffDiveTransition(this.route, roadLift, this.quality);
+    this.cliffTransition = this.diveTransition.group;
+    this.track.add(this.cliffTransition);
     this.add(this.track);
 
-    this.scenery = options.scenery === false
-      ? new Group()
+    const sceneryData = options.scenery === false
+      ? { group: new Group(), airborne: [] as AirborneCue[] }
       : makeScenery(this.route, this.quality);
+    this.scenery = sceneryData.group;
+    this.airborneCues = sceneryData.airborne;
     this.scenery.name = "rift-scenery";
     this.add(this.scenery);
 
@@ -1190,11 +1872,27 @@ export class RiftWorld extends Group {
     this.add(this.tunnelCues);
 
     const underwaterData = options.environmentCues === false
-      ? { group: new Group(), bubbles: [] as UnderwaterCue[] }
+      ? { group: new Group(), bubbles: [] as UnderwaterCue[], materials: [] as UnderwaterMaterial[] }
       : makeUnderwaterCues(this.route, this.quality);
     this.underwaterCues = underwaterData.group;
     this.bubbleData = underwaterData.bubbles;
+    this.underwaterMaterials = underwaterData.materials;
     this.add(this.underwaterCues);
+
+    // The enclosure is part of the map, not regional decoration. Keep these
+    // two surfaces present even when distant fish, ribs and lights are culled.
+    const enclosures = new Group();
+    enclosures.name = "rift-permanent-enclosures";
+    for (const name of ["rift-tunnel-shell", "rift-underwater-glass-tube"]) {
+      const shell = this.getObjectByName(name);
+      if (shell) enclosures.add(shell);
+    }
+    this.add(enclosures);
+    this.localVisibility = new LocalSceneVisibility(this, this.route, this.quality);
+  }
+
+  resetTransitions(): void {
+    this.diveTransition.reset();
   }
 
   /** Animate emissive accents and environment dressing for one host frame. */
@@ -1209,6 +1907,73 @@ export class RiftWorld extends Group {
     // occlusion. Hiding whole sections caused the tunnel to pop into view.
     const ocean = this.environment.getObjectByName("rift-coastal-water-surface") as Mesh<PlaneGeometry, ShaderMaterial>;
     ocean.material.uniforms.time.value = this.elapsedSeconds;
+    let focusDistance: number | undefined;
+    let normalizedFocus: number | undefined;
+    if (typeof state.routeDistance === "number" && Number.isFinite(state.routeDistance)) {
+      focusDistance = state.routeDistance;
+    } else if (state.playerPosition
+      && Number.isFinite(state.playerPosition.x)
+      && Number.isFinite(state.playerPosition.y)
+      && Number.isFinite(state.playerPosition.z)) {
+      focusDistance = findNearestTrackPoint(this.route, state.playerPosition).distanceAlongTrack;
+    }
+    // Apply broad spatial visibility first. The route-distance pass below is
+    // intentionally authoritative for road decoration, so a nearby flyover
+    // cannot accidentally re-enable a far route chunk.
+    const focus = state.playerPosition ?? (focusDistance === undefined ? undefined : sampleTrackPosition(this.route, focusDistance));
+    this.localVisibility.update(focus);
+    if (focusDistance !== undefined && this.route.totalLength > EPSILON) {
+      normalizedFocus = this.route.closed
+        ? ((focusDistance % this.route.totalLength) + this.route.totalLength) % this.route.totalLength
+        : clamp(focusDistance, 0, this.route.totalLength);
+      const cullRadius = this.quality === "eco" ? 176 : this.quality === "ultra" ? 300 : 236;
+      for (const item of this.decorativeCullItems) {
+        const distance = Math.abs(item.routeDistance - normalizedFocus);
+        const routeGap = this.route.closed
+          ? Math.min(distance, this.route.totalLength - distance)
+          : distance;
+        item.object.visible = item.object.visible && routeGap <= cullRadius + item.halfSpan;
+      }
+    } else {
+      // Editor previews and static screenshots have no player focus; keep all
+      // decorative chunks available in that mode.
+      this.decorativeCullItems.forEach((item) => { item.object.visible = true; });
+    }
+    this.diveTransition.update(delta, normalizedFocus, finiteOr(state.speed, 0), state.playerPosition);
+    const activeSection = focusDistance === undefined
+      ? "coastal-boulevard"
+      : sampleTrackSection(this.route, focusDistance);
+    const underwater = state.submerged ?? activeSection === "underwater";
+    const sun = this.getObjectByName("rift-synthwave-sun");
+    if (sun) sun.visible = !underwater;
+    // Bring decoration in before the entrance. The enclosure surfaces above
+    // stay visible regardless of region; fog softens the distant detail limit.
+    const nearSection = (section: TrackSection): boolean => normalizedFocus === undefined
+      || (this.sectionRanges.get(section) ?? []).some((range) => {
+        const distance = normalizedFocus!;
+        return (distance >= range.start - 100 && distance <= range.end + 100)
+          || (this.route.closed && (
+            distance + this.route.totalLength <= range.end + 100
+            || distance - this.route.totalLength >= range.start - 100
+          ));
+      });
+    this.tunnelCues.visible = nearSection("tunnel");
+    this.underwaterCues.visible = nearSection("underwater");
+    const skyColors = underwater ? [0x063b52, 0x0b4a5b, 0x052638] : [0x170a36, 0xeb5795, 0x49244f];
+    const fade = delta === 0 ? 1 : 1 - Math.exp(-delta * 3);
+    for (const [index, name] of ["topColor", "horizonColor", "lowColor"].entries()) {
+      (this.sky.material.uniforms[name].value as Color).lerp(new Color(skyColors[index]), fade);
+    }
+    if (this.shadowLight && state.playerPosition) {
+      const position = state.playerPosition;
+      this.shadowLight.target.position.set(position.x, position.y, position.z);
+      this.shadowLight.position.copy(this.shadowLight.target.position).add(new Vector3(44, 65, 20));
+    }
+    if (state.playerPosition) {
+      const position = state.playerPosition;
+      (ocean.material.uniforms.playerPosition.value as Vector3).set(position.x, position.y, position.z);
+      this.getObjectByName("rift-synthwave-sun")?.position.set(position.x, position.y, position.z);
+    }
 
     const speedBoost = clamp(Math.abs(finiteOr(state.speed, 0)) / 34, 0, 1);
     this.dynamicLightData.forEach(({ light, baseIntensity, phase }) => {
@@ -1224,11 +1989,31 @@ export class RiftWorld extends Group {
     this.tunnelCueData.forEach((cue) => {
       const material = cue.ring.material;
       material.opacity = clamp(0.58 + 0.3 * (0.5 + 0.5 * Math.sin(this.elapsedSeconds * 5 + cue.phase)), 0.3, 1);
+      cue.lightMaterial.opacity = clamp(0.62 + 0.28 * (0.5 + 0.5 * Math.sin(this.elapsedSeconds * 5 + cue.phase + 0.7)), 0.42, 0.94);
+    });
+    this.underwaterMaterials.forEach((material) => {
+      material.uniforms.time.value = this.elapsedSeconds;
+    });
+    const airborneMatrix = new Matrix4();
+    const updatedAirborneMeshes = new Set<InstancedMesh>();
+    this.airborneCues.forEach((cue) => {
+      const sway = Math.sin(this.elapsedSeconds * 0.32 + cue.phase);
+      const lift = Math.sin(this.elapsedSeconds * 0.8 + cue.phase * 1.7) * 0.45;
+      const position = cue.basePosition.clone()
+        .add(new Vector3(sway * 1.4, lift, Math.cos(this.elapsedSeconds * 0.24 + cue.phase) * 0.8));
+      airborneMatrix.compose(position, cue.rotation, cue.scale);
+      cue.mesh.setMatrixAt(cue.index, airborneMatrix);
+      updatedAirborneMeshes.add(cue.mesh);
+    });
+    updatedAirborneMeshes.forEach((mesh) => {
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.computeBoundingSphere();
     });
     this.bubbleData.forEach((bubble) => {
       bubble.object.position.y = bubble.baseY + Math.sin(this.elapsedSeconds * 1.7 + bubble.phase) * bubble.amplitude;
-      const scale = 0.88 + 0.15 * Math.sin(this.elapsedSeconds * 2.2 + bubble.phase);
-      bubble.object.scale.setScalar(scale);
+      const scale = bubble.baseScale * (0.88 + 0.15 * Math.sin(this.elapsedSeconds * 2.2 + bubble.phase));
+      if (bubble.object instanceof Sprite) bubble.object.scale.set(scale * 2.4, scale * 1.2, 1);
+      else bubble.object.scale.setScalar(scale);
     });
   }
 

@@ -1,20 +1,30 @@
 import {
   AdditiveBlending,
   BoxGeometry,
+  BufferAttribute,
   BufferGeometry,
+  DataTexture,
+  LinearFilter,
   Float32BufferAttribute,
   Group,
   Mesh,
   MeshBasicMaterial,
   Object3D,
-  PlaneGeometry,
   Points,
   PointsMaterial,
+  Color,
+  Shape,
+  ShapeGeometry,
+  Texture,
+  DoubleSide,
   Vector3,
 } from "three";
 import type { CarState } from "../game/arcade";
-import { SAMPLE_ROUTE, sampleTrackPosition, sampleTrackTangent, sampleTrackWidth, type TrackRoute } from "../game/track";
+import { SAMPLE_ROUTE, sampleTrackPosition, sampleTrackTangent, sampleTrackSection, sampleTrackWidth, type TrackRoute } from "../game/track";
 import type { QualityTier } from "../game/performance";
+import { TyreTrails } from "./skids";
+import { SpeedEffects } from "./speed-effects";
+import { WaterEntryEffect } from "./water-entry";
 
 const UP = new Vector3(0, 1, 0);
 const FORWARD = new Vector3(0, 0, 1);
@@ -39,17 +49,12 @@ export interface RiftEffectsUpdateOptions {
 export interface ChevronMarkerOptions {
   spacing?: number;
   maxMarkers?: number;
+  quality?: QualityTier;
   offsetFromEdge?: number;
   height?: number;
   length?: number;
   color?: number;
 }
-
-type SkidMark = {
-  mesh: Mesh<PlaneGeometry, MeshBasicMaterial>;
-  life: number;
-  maxLife: number;
-};
 
 type Spark = {
   position: Vector3;
@@ -60,8 +65,11 @@ type Spark = {
 };
 
 type ChevronPulse = {
-  material: MeshBasicMaterial;
+  marker: Group;
+  sweep: Mesh;
   phase: number;
+  baseScale: number;
+  sweepTravel: number;
 };
 
 function clamp(value: number, minimum: number, maximum: number): number {
@@ -78,26 +86,6 @@ function makeSideVector(tangent: Vector3, target = new Vector3()): Vector3 {
   return target.normalize();
 }
 
-function makeSkidMarkPool(count: number): SkidMark[] {
-  const marks: SkidMark[] = [];
-  for (let index = 0; index < count; index += 1) {
-    const material = new MeshBasicMaterial({
-      name: "rift-skid-mark-material",
-      color: 0x130d24,
-      transparent: true,
-      opacity: 0,
-      depthWrite: false,
-    });
-    const mesh = new Mesh(new PlaneGeometry(0.32, 1.35), material);
-    mesh.name = "rift-drifting-skid-mark";
-    mesh.rotation.x = -Math.PI * 0.5;
-    mesh.visible = false;
-    mesh.renderOrder = 1;
-    marks.push({ mesh, life: 0, maxLife: 1 });
-  }
-  return marks;
-}
-
 function createSparkPoints(count: number): {
   points: Points<BufferGeometry, PointsMaterial>;
   positions: Float32Array;
@@ -112,11 +100,19 @@ function createSparkPoints(count: number): {
     colors[index * 3 + 2] = 0.08;
   }
   const geometry = new BufferGeometry();
-  geometry.setAttribute("position", new Float32BufferAttribute(positions, 3));
-  geometry.setAttribute("color", new Float32BufferAttribute(colors, 3));
+  geometry.setAttribute("position", new BufferAttribute(positions, 3));
+  geometry.setAttribute("color", new BufferAttribute(colors, 3));
+  const glowPixels = new Uint8Array(32 * 32 * 4);
+  for (let y = 0; y < 32; y += 1) for (let x = 0; x < 32; x += 1) {
+    const radius = Math.hypot((x - 15.5) / 15.5, (y - 15.5) / 15.5);
+    glowPixels.set([255, 255, 255, Math.round(Math.max(0, 1 - radius) ** 1.6 * 255)], (y * 32 + x) * 4);
+  }
+  const glow = new DataTexture(glowPixels, 32, 32);
+  glow.magFilter = glow.minFilter = LinearFilter;glow.needsUpdate = true;
   const material = new PointsMaterial({
     name: "rift-drift-spark-material",
-    size: 0.18,
+    map: glow,
+    size: 0.23,
     vertexColors: true,
     transparent: true,
     opacity: 0.95,
@@ -164,69 +160,69 @@ function disposeObject(root: Object3D): void {
     }
   });
   geometries.forEach((geometry) => geometry.dispose());
-  materials.forEach((material) => material.dispose());
+  materials.forEach((material) => {
+    for (const value of Object.values(material)) if (value instanceof Texture) value.dispose();
+    material.dispose();
+  });
 }
 
-/**
- * Build hot-pink/cyan directional chevrons along the outside edge of each
- * route segment. They are meshes rather than fat lines, so they remain visible
- * on WebGL implementations that ignore LineBasicMaterial linewidth.
- */
+/** Upright yellow double chevrons on the outside of upcoming bends. */
 export function createChevronMarkers(
   route: TrackRoute = SAMPLE_ROUTE,
   options: ChevronMarkerOptions = {},
 ): Group {
-  const group = new Group();
-  group.name = "rift-chevron-markers";
-  const spacing = Math.max(3, finiteOr(options.spacing, 13));
-  const maxMarkers = Math.max(1, Math.floor(finiteOr(options.maxMarkers, 48)));
-  const edgeOffset = clamp(finiteOr(options.offsetFromEdge, 0.5), 0.1, 0.95);
-  const height = Math.max(0.035, finiteOr(options.height, 0.095));
-  const length = Math.max(0.28, finiteOr(options.length, 0.92));
-  const color = options.color ?? 0xff42bd;
-  const material = new MeshBasicMaterial({
-    name: "rift-chevron-material",
-    color,
-    transparent: true,
-    opacity: 0.9,
-    depthWrite: false,
-    blending: AdditiveBlending,
-  });
-  const barGeometry = new BoxGeometry(0.12, height, length);
-  let markerCount = 0;
-
-  for (let distance = spacing; distance < route.totalLength && markerCount < maxMarkers; distance += spacing) {
+  const group = new Group();group.name = "rift-chevron-markers";
+  const spacing = Math.max(6, finiteOr(options.spacing, 13));
+  const cap = options.quality === "eco" ? 24 : options.quality === "ultra" ? 64 : 44;
+  const maximum = Math.max(1, Math.min(Math.floor(finiteOr(options.maxMarkers, cap)), cap));
+  const height = Math.max(0.6, finiteOr(options.height, 1.2));
+  const width = Math.max(2, finiteOr(options.length, 3.6));
+  const shape = new Shape();
+  shape.moveTo(-0.57, -0.72);shape.lineTo(-0.02, -0.72);shape.lineTo(0.66, 0);
+  shape.lineTo(-0.02, 0.72);shape.lineTo(-0.57, 0.72);shape.lineTo(0.12, 0);shape.closePath();
+  const arrowGeometry = new ShapeGeometry(shape);
+  const arrowMaterial = new MeshBasicMaterial({ color: new Color(options.color ?? 0xffdb42).multiplyScalar(2.5), side: DoubleSide });
+  const backing = new MeshBasicMaterial({ color: 0x161326 });
+  const signGeometry = new BoxGeometry(width, height * 1.5, 0.12);
+  const poleGeometry = new BoxGeometry(0.12, 2.3, 0.12);
+  const underlineGeometry = new BoxGeometry(width - 0.15, 0.035, 0.035);
+  const candidates: Array<{ distance: number; side: number }> = [];
+  let previous = -Infinity;
+  for (let distance = spacing; distance < route.totalLength; distance += spacing) {
+    if (sampleTrackSection(route, distance) === "cliff-dive") continue;
     const tangent = sampleTrackTangent(route, distance);
-    const ahead = sampleTrackTangent(route, distance + 12);
-    // Use distance spacing, independent of how finely the road is sampled.
-    if (tangent.dot(ahead) > 0.97) continue;
-    const side = makeSideVector(tangent);
-      const position = sampleTrackPosition(route, distance);
-      const width = sampleTrackWidth(route, distance);
-      const turnSide = tangent.clone().cross(ahead).y > 0 ? -1 : 1;
-      const marker = new Group();
-      marker.name = "rift-chevron-marker";
-      marker.position
-        .copy(position)
-        .addScaledVector(side, turnSide * width * edgeOffset)
-        .addScaledVector(UP, 0.13);
-      marker.quaternion.setFromUnitVectors(FORWARD, tangent);
-      marker.userData.riftChevron = true;
-
-      const left = new Mesh(barGeometry, material);
-      left.name = "rift-chevron-left";
-      left.position.x = -length * 0.22;
-      left.rotation.y = -0.62;
-      const right = new Mesh(barGeometry, material);
-      right.name = "rift-chevron-right";
-      right.position.x = length * 0.22;
-      right.rotation.y = 0.62;
-      marker.add(left, right);
-      group.add(marker);
-      markerCount += 1;
+    const ahead = sampleTrackTangent(route, distance + 28);
+    const turn = tangent.clone().cross(ahead).y;
+    if (Math.abs(turn) < 0.15 || distance - previous < 15) continue;
+    candidates.push({ distance, side: turn > 0 ? -1 : 1 });previous = distance;
   }
-
-  group.userData.riftChevronMaterial = material;
+  const stride = Math.max(1, candidates.length / maximum);
+  for (let selected = 0; selected < Math.min(maximum, candidates.length); selected++) {
+    const candidate = candidates[Math.floor(selected * stride)];
+    const { distance, side: turnSide } = candidate;
+    const tangent = sampleTrackTangent(route, distance);
+    const marker = new Group();marker.name = "rift-chevron-marker";
+    marker.position.copy(sampleTrackPosition(route, distance)).addScaledVector(makeSideVector(tangent),
+      turnSide * (sampleTrackWidth(route, distance) / 2 + width / 2 + 0.85));
+    // Heading only keeps roadside signs vertical even on the steep dive.
+    marker.rotation.y = Math.atan2(tangent.x, tangent.z);
+    marker.userData.riftChevron = true;marker.userData.routeDistance = distance;marker.userData.turnSide = turnSide;
+    marker.userData.riftChevronBaseScale = 1;marker.userData.riftChevronSweepTravel = 0;
+    const sign = new Mesh(signGeometry, backing);sign.name = "rift-bend-sign-backplate";
+    sign.position.y = 1.95;marker.add(sign);
+    for (const x of [-width * 0.35, width * 0.35]) {
+      const post = new Mesh(poleGeometry, backing);post.position.set(x, 1.15, 0.025);marker.add(post);
+    }
+    for (const offset of [-0.85, 0.85]) {
+      const arrow = new Mesh(arrowGeometry, arrowMaterial);arrow.name = "rift-bend-direction-arrow";
+      arrow.position.set(offset, 1.95, -0.075);arrow.scale.set(-turnSide * height / 1.2, height / 1.2, 1);marker.add(arrow);
+    }
+    const sweep = new Mesh(underlineGeometry, new MeshBasicMaterial({
+      color: 0xffa74b, transparent: true, opacity: 0.8,
+    }));
+    sweep.name = "rift-chevron-sweep";sweep.position.set(0, 1.95 - height * 0.72, -0.085);marker.add(sweep);
+    group.add(marker);
+  }
   return group;
 }
 
@@ -237,16 +233,16 @@ export class RiftEffects extends Group {
   readonly sparks: Points<BufferGeometry, PointsMaterial>;
   readonly chevrons: Group;
 
-  private readonly skidPool: SkidMark[];
+  private readonly waterEntry = new WaterEntryEffect();
+  private readonly tyreTrails: TyreTrails;
+  private readonly speedEffects: SpeedEffects;
   private readonly sparkPool: Spark[];
   private readonly sparkPositions: Float32Array;
   private readonly sparkColors: Float32Array;
   private readonly sparkPositionAttribute: Float32BufferAttribute;
   private readonly sparkColorAttribute: Float32BufferAttribute;
   private readonly chevronPulses: ChevronPulse[] = [];
-  private skidCursor = 0;
   private sparkCursor = 0;
-  private skidAccumulator = 0;
   private sparkAccumulator = 0;
   private emissionScale = 1;
   private elapsedSeconds = 0;
@@ -255,18 +251,19 @@ export class RiftEffects extends Group {
 
   constructor(options: RiftEffectsOptions = {}) {
     super();
-    this.name = "rift-racer-effects";
+    this.name = "rift-racer-effects";this.add(this.waterEntry);
     this.route = options.route ?? SAMPLE_ROUTE;
     const quality = options.quality ?? "balanced";
-    const defaultSkidMarks = quality === "eco" ? 24 : quality === "ultra" ? 72 : 44;
+    const defaultSkidMarks = quality === "eco" ? 512 : quality === "ultra" ? 4096 : 2048;
     const defaultSparks = quality === "eco" ? 48 : quality === "ultra" ? 180 : 108;
     const skidCount = Math.max(4, Math.floor(finiteOr(options.maxSkidMarks, defaultSkidMarks)));
     const sparkCount = Math.max(8, Math.floor(finiteOr(options.maxSparks, defaultSparks)));
 
     this.skidMarks = new Group();
     this.skidMarks.name = "rift-skid-marks";
-    this.skidPool = makeSkidMarkPool(skidCount);
-    this.skidPool.forEach((mark) => this.skidMarks.add(mark.mesh));
+    this.tyreTrails = new TyreTrails(this.route, skidCount);
+    this.speedEffects = new SpeedEffects(quality);this.add(this.speedEffects);
+    this.skidMarks.add(this.tyreTrails.mesh);
     this.add(this.skidMarks);
 
     const sparkData = createSparkPoints(sparkCount);
@@ -287,12 +284,19 @@ export class RiftEffects extends Group {
     if (options.chevrons !== false) {
       this.chevrons = createChevronMarkers(this.route, {
         spacing: options.chevronSpacing,
+        quality,
       });
       this.chevrons.traverse((object) => {
-        const material = (object as Mesh).material;
-        if (material instanceof MeshBasicMaterial) {
-          this.chevronPulses.push({ material, phase: this.chevronPulses.length * 0.28 });
-        }
+        if (!(object instanceof Group) || object.userData.riftChevron !== true) return;
+        const sweep = object.getObjectByName("rift-chevron-sweep");
+        if (!(sweep instanceof Mesh)) return;
+        this.chevronPulses.push({
+          marker: object,
+          sweep,
+          phase: this.chevronPulses.length * 0.28,
+          baseScale: finiteOr(object.userData.riftChevronBaseScale, 1),
+          sweepTravel: finiteOr(object.userData.riftChevronSweepTravel, 1),
+        });
       });
     } else {
       this.chevrons = new Group();
@@ -305,16 +309,8 @@ export class RiftEffects extends Group {
    * Add a skid stamp at a wheel anchor. The pool makes sustained drifts cheap.
    */
   emitSkid(position: Vector3, heading: number, intensity = 1): void {
-    const mark = this.skidPool[this.skidCursor % this.skidPool.length];
-    this.skidCursor = (this.skidCursor + 1) % this.skidPool.length;
-    mark.life = 0.85 + clamp(intensity, 0, 1) * 0.85;
-    mark.maxLife = mark.life;
-    mark.mesh.visible = true;
-    mark.mesh.position.copy(position);
-    mark.mesh.position.y += 0.025;
-    mark.mesh.rotation.set(-Math.PI * 0.5, heading, 0, "YXZ");
-    mark.mesh.scale.set(0.85 + clamp(intensity, 0, 1) * 0.35, 0.8 + clamp(intensity, 0, 1) * 0.6, 1);
-    mark.mesh.material.opacity = 0.42 + clamp(intensity, 0, 1) * 0.27;
+    const forward = new Vector3(Math.sin(heading), 0, Math.cos(heading));
+    this.tyreTrails.add(position.clone().addScaledVector(forward, -0.5), position.clone().addScaledVector(forward, 0.5), intensity);
   }
 
   /** Emit a short burst of orange/pink particles from a world-space point. */
@@ -343,9 +339,9 @@ export class RiftEffects extends Group {
       this.sparkPositions[offset + 1] = spark.position.y;
       this.sparkPositions[offset + 2] = spark.position.z;
       const hot = random();
-      this.sparkColors[offset] = 1;
-      this.sparkColors[offset + 1] = 0.24 + hot * 0.64;
-      this.sparkColors[offset + 2] = 0.06 + hot * 0.26;
+      this.sparkColors[offset] = 3.2;
+      this.sparkColors[offset + 1] = 0.8 + hot * 1.6;
+      this.sparkColors[offset + 2] = 0.18 + hot * 0.5;
     }
     this.sparkPositionAttribute.needsUpdate = true;
     this.sparkColorAttribute.needsUpdate = true;
@@ -361,28 +357,27 @@ export class RiftEffects extends Group {
     const delta = clamp(finiteOr(deltaSeconds, 0), 0, 0.1);
     this.elapsedSeconds += delta;
 
-    this.updateSkidMarks(delta);
+    this.waterEntry.update(delta);
+    this.tyreTrails.update(delta);
     this.updateSparks(delta);
     this.updateChevrons();
+    this.speedEffects.update(delta, options.emitDriftEffects === false && carState ? { ...carState, drift: 0 } : carState, options.wheelPositions);
 
-    if (!carState || options.emitDriftEffects === false) return;
+    if (!carState || options.emitDriftEffects === false) {
+      this.tyreTrails.stop();
+      return;
+    }
     const speed = Math.max(0, finiteOr(carState.speed, carState.velocity.length()));
     const drift = clamp(finiteOr(carState.drift, 0), 0, 1);
     const steering = Math.abs(clamp(finiteOr(carState.steering, 0), -1, 1));
-    if (drift <= 0.12 || speed <= 4 || steering <= 0.04) return;
-
-    this.skidAccumulator += delta * (0.7 + speed * 0.07) * this.emissionScale;
-    this.sparkAccumulator += delta * (0.35 + drift * speed * 0.06) * this.emissionScale;
-    const wheels = options.wheelPositions ? [...options.wheelPositions] : getWheelPositionsFromState(carState);
-    const heading = finiteOr(carState.heading, 0);
-    if (this.skidAccumulator >= 0.055) {
-      this.skidAccumulator = 0;
-      const intensity = clamp(drift * 0.7 + steering * 0.3, 0, 1);
-      // Rear wheels leave the readable marks; front wheels remain available to
-      // callers that want four-wheel burnout feedback.
-      if (wheels[2]) this.emitSkid(wheels[2], heading, intensity);
-      if (wheels[3]) this.emitSkid(wheels[3], heading, intensity);
+    if (speed <= 4 || (drift <= 0.12 && carState.brake < 0.7)) {
+      this.tyreTrails.stop();
+      return;
     }
+    const wheels = options.wheelPositions ? [...options.wheelPositions] : getWheelPositionsFromState(carState);
+    const intensity = clamp(0.55 + drift * 0.35 + steering * 0.1, 0, 1);
+    this.tyreTrails.draw(wheels, intensity);
+    this.sparkAccumulator += delta * (0.35 + drift * speed * 0.06) * this.emissionScale;
     if (this.sparkAccumulator >= 0.14) {
       this.sparkAccumulator = 0;
       const origin = wheels[2] ?? carState.position;
@@ -395,14 +390,13 @@ export class RiftEffects extends Group {
     this.update(deltaSeconds, carState, options);
   }
 
+  emitSplash(position: Vector3): void { this.waterEntry.emit(position); }
+
   clearEffects(): void {
-    this.skidAccumulator = 0;
+    this.waterEntry.reset();
     this.sparkAccumulator = 0;
-    this.skidPool.forEach((mark) => {
-      mark.life = 0;
-      mark.mesh.visible = false;
-      mark.mesh.material.opacity = 0;
-    });
+    this.speedEffects.clearEffects();
+    this.tyreTrails.clear();
     this.sparkPool.forEach((spark, index) => {
       spark.active = false;
       spark.life = 0;
@@ -418,27 +412,13 @@ export class RiftEffects extends Group {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    disposeObject(this);
     this.clearEffects();
+    disposeObject(this);
     super.clear();
   }
 
   setEmissionScale(scale: number): void {
     this.emissionScale = clamp(finiteOr(scale, 1), 0.2, 1.5);
-  }
-
-  private updateSkidMarks(delta: number): void {
-    this.skidPool.forEach((mark) => {
-      if (mark.life <= 0) return;
-      mark.life -= delta;
-      if (mark.life <= 0) {
-        mark.life = 0;
-        mark.mesh.visible = false;
-        mark.mesh.material.opacity = 0;
-        return;
-      }
-      mark.mesh.material.opacity = 0.69 * clamp(mark.life / Math.max(mark.maxLife, EPSILON), 0, 1);
-    });
   }
 
   private updateSparks(delta: number): void {
@@ -464,9 +444,17 @@ export class RiftEffects extends Group {
   }
 
   private updateChevrons(): void {
-    this.chevronPulses.forEach((pulse) => {
-      pulse.material.opacity = 0.62 + 0.28 * (0.5 + 0.5 * Math.sin(this.elapsedSeconds * 4.2 + pulse.phase));
-    });
+    // Keep this animation pass allocation-free: the marker count is capped at
+    // construction time, and every frame only mutates already-owned transforms.
+    for (let index = 0; index < this.chevronPulses.length; index += 1) {
+      const pulse = this.chevronPulses[index];
+      const brightness = 0.5 + 0.5 * Math.sin(this.elapsedSeconds * 4.2 + pulse.phase);
+      // Pulse the fine underline, keeping signs and posts firmly grounded.
+      (pulse.sweep.material as MeshBasicMaterial).opacity = 0.55 + brightness * 0.4;
+      const sweepCycle = ((this.elapsedSeconds * 0.9 + pulse.phase / (Math.PI * 2)) % 1 + 1) % 1;
+      pulse.sweep.position.z = (sweepCycle * 2 - 1) * pulse.sweepTravel;
+      pulse.sweep.scale.x = 0.88 + brightness * 0.12;
+    }
   }
 
   private nextRandom(): number {

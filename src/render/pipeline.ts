@@ -18,6 +18,8 @@ export class RenderPipeline {
     this.dispose();
     if (!QUALITY_SETTINGS[quality].postProcessing) return;
     this.composer = new EffectComposer(this.renderer);
+    this.composer.renderTarget1.samples = quality === "ultra" ? 4 : 2;
+    this.composer.renderTarget2.samples = quality === "ultra" ? 4 : 2;
     this.composer.addPass(new RenderPass(this.scene, this.camera));
     this.composer.addPass(new UnrealBloomPass(new Vector2(1, 1), quality === "ultra" ? 0.38 : 0.26, 0.35, 1.05));
     this.composer.addPass(new OutputPass());
